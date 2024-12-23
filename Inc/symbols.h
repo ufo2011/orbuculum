@@ -16,6 +16,10 @@
 
 #include "uthash.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define ASSY_NOT_FOUND    0xffffffff        /* Assembly line not found */
 #define NO_LINE           0xffffffff        /* No line number defined */
 #define NO_FILE           0xffffffff        /* No file defined */
@@ -28,6 +32,8 @@
 
 #define INTERRUPT         (SPECIALS_MASK|0xd)
 #define FN_INTERRUPT_STR  "INTERRUPT"
+
+enum symbolErr { SYMBOL_OK, SYMBOL_NOELF, SYMBOL_NOOBJDUMP, SYMBOL_UNSPECIFIED };
 
 /* Mapping of lines numbers to indicies */
 struct assyLineEntry
@@ -42,6 +48,7 @@ struct assyLineEntry
     bool isJump;                            /* This is a potential jump */
     bool isSubCall;                         /* this is a subrouine call (BL/BLX) */
     bool isReturn;                          /* this is a return instruction (i.e. branch to LR or pop into PC) */
+    bool etm4branch;                        /* Will this be traced as an endpoint for ETM4 decode? */
     uint32_t jumpdest;                      /* If this is an absolute jump, the destination */
 };
 
@@ -84,7 +91,7 @@ struct SymbolSet
 {
     char *elfFile;                         /* File containing structure info */
     char *deleteMaterial;                  /* Material to strip off filenames */
-
+    char *odoptions;                       /* Any options to pass directly to objdump */
     struct stat st;
 
     /* For memory saving and speedup... */
@@ -118,12 +125,17 @@ struct nameEntry
 };
 
 // ====================================================================================================
-struct SymbolSet *SymbolSetCreate( const char *filename, const char *deleteMaterial, bool demanglecpp, bool recordSource, bool recordAssy );
-
+enum symbolErr SymbolSetCreate( struct SymbolSet **ss, const char *filename, const char *deleteMaterial,
+                                bool demanglecpp, bool recordSource, bool recordAssy, const char *objdumpOptions );
 void SymbolSetDelete( struct SymbolSet **s );
 bool SymbolSetValid( struct SymbolSet **s, char *filename );
 const char *SymbolFilename( struct SymbolSet *s, uint32_t index );
 const char *SymbolFunction( struct SymbolSet *s, uint32_t index );
 bool SymbolLookup( struct SymbolSet *s, uint32_t addr, struct nameEntry *n );
 // ====================================================================================================
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

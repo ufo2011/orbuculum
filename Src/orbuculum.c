@@ -1,89 +1,97 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /*
- * Orbuculum main receiver and TPIU demux
- * ======================================
+ * Orbuculum main receiver and TPIU/OFLOW demux
+ * ============================================
  *
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <ctype.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <assert.h>
+#ifdef WIN32
+    #include <winsock2.h>
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <netdb.h>
+    #include <arpa/inet.h>
+    #include <libgen.h>
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <strings.h>
 #include <string.h>
-#include <pthread.h>
+#include <getopt.h>
 #if defined OSX
     #include <sys/ioctl.h>
     #include <libusb.h>
     #include <termios.h>
-#else
-    #if defined LINUX
-        #include <libusb-1.0/libusb.h>
-        #include <asm/ioctls.h>
-        #if defined TCGETS2
-            #include <asm/termios.h>
-            /* Manual declaration to avoid conflict. */
-            extern int ioctl ( int __fd, unsigned long int __request, ... ) __THROW;
-        #else
-            #include <sys/ioctl.h>
-            #include <termios.h>
-        #endif
+#elif defined LINUX
+    #include <libusb-1.0/libusb.h>
+    #include <asm/ioctls.h>
+    #if defined TCGETS2
+        #include <asm/termios.h>
+        /* Manual declaration to avoid conflict. */
+        extern int ioctl ( int __fd, unsigned long int __request, ... ) ;
     #else
-        #error "Unknown OS"
+        #include <sys/ioctl.h>
+        #include <termios.h>
     #endif
+#elif defined FREEBSD
+    #include <libusb.h>
+    #include <sys/ioctl.h>
+    #include <termios.h>
+#elif defined WIN32
+    #include <libusb.h>
+#else
+    #error "Unknown OS"
 #endif
 #include <signal.h>
 
 #include "git_version_info.h"
 #include "generics.h"
 #include "tpiuDecoder.h"
-
+#include "oflow.h"
 #include "nwclient.h"
+#include "orbtraceIf.h"
+#include "stream.h"
 
-#define SEGGER_HOST "localhost"               /* Address to connect to SEGGER */
-#define SEGGER_PORT (2332)
+#define MAX_LINE_LEN (1024)
+#define ORBTRACE "orbtrace"
+#define ORBTRACEENVNAME "ORBTRACE"
 
-#define NUM_TPIU_CHANNELS 0x80
+/* Multiple blocks are used for USB, otherwise just the one */
+#define NUM_RAW_BLOCKS (32)
 
-/* Table of known devices to try opening */
-static const struct deviceList
+/* File header for OFLOW formatted file */
+#define OFLOW_SIG (const char*)"%%ORBFLOW1.0.0%%"
+#define OFLOW_SIG_LEN (strlen(OFLOW_SIG))
+
+/* Number of potential tags */
+#define NUM_TAGS (256)
+#define LAST_TAG_SEEN_TIME_NS (2*1000L*1000L*1000L)
+
+/* Record of transferred data per tag */
+struct TagDataCount
 {
-    uint32_t vid;
-    uint32_t pid;
-    bool autodiscover;
-    uint8_t iface;
-    uint8_t ep;
-    char *name;
-} _deviceList[] =
-{
-    { 0x1209, 0x3443, true,  0, 0x81, "Orbtrace"         },
-    { 0x1d50, 0x6018, false, 5, 0x85, "Blackmagic Probe" },
-    { 0x2b3e, 0xc610, false, 3, 0x85, "Phywhisperer-UDT" },
-    { 0, 0, 0, 0, 0 }
+    bool     hasHandler;
+    uint64_t ts;
+    uint64_t totalData;
+    uint64_t intervalData;
 };
-
-//#define DUMP_BLOCK
-
-/* How many transfer buffers from the source to allocate */
-#define NUM_RAW_BLOCKS (3)
-
-/* Interval between blocks for timeouts..smaller means smoother, but higher CPU load */
-#define BLOCK_TIMEOUT_INTERVAL_MS (50)
 
 /* Record for options, either defaults or from command line */
 struct Options
 {
     /* Config information */
-    bool segger;                                         /* Using a segger debugger */
+    bool nwserver;                                       /* Using a nw server source */
 
     /* Source information */
-    char *seggerHost;                                    /* Segger host connection */
-    int32_t seggerPort;                                  /* ...and port */
+    char *nwserverHost;                                  /* NW Server host connection */
+    int32_t nwserverPort;                                /* ...and port */
     char *port;                                          /* Serial host connection */
     int speed;                                           /* Speed of serial link */
     bool useTPIU;                                        /* Are we using TPIU, and stripping TPIU frames? */
@@ -91,60 +99,76 @@ struct Options
     char *file;                                          /* File host connection */
     bool fileTerminate;                                  /* Terminate when file read isn't successful */
     char *outfile;                                       /* Output file for raw data dumping */
-
+    char *otcl;                                          /* Orbtrace command line options */
     uint32_t intervalReportTime;                         /* If we want interval reports about performance */
-
-    char *channelList;                                   /* List of TPIU channels to be serviced */
-
-    /* Network link */
+    bool mono;                                           /* Supress colour in output */
+    int paceDelay;                                       /* Delay between blocks of data transmission in file readout */
+    char *channelList;                                   /* List of channels to be exported over legacy connection */
+    bool hiresTime;                                      /* Use hiresolution time (shorter timeouts...obsolete) */
+    char *sn;                                            /* Any part serial number for identifying a specific device */
     int listenPort;                                      /* Listening port for network */
-} _options =
-{
-    .listenPort = NWCLIENT_SERVER_PORT,
-    .seggerHost = SEGGER_HOST,
-};
-
-struct dataBlock
-{
-    ssize_t fillLevel;
-    uint8_t buffer[TRANSFER_SIZE];
-    struct libusb_transfer *usbtfr;
 };
 
 struct handlers
 {
-    uint8_t channel;
-    uint64_t intervalBytes;                                                  /* Number of depacketised bytes output on this channel */
-    struct dataBlock *strippedBlock;                                         /* Processed buffer for output to clients */
-    struct nwclientsHandle *n;                                               /* Link to the network client subsystem */
+    int channel;                                         /* Channel number for this handler */
+    struct dataBlock *strippedBlock;                     /* Processed buffers for output to clients */
+    struct nwclientsHandle *n;                           /* Link to the network client subsystem */
 };
 
 struct RunTime
 {
-    struct TPIUDecoder t;                                                    /* TPIU decoder instance, in case we need it */
+    struct TPIUDecoder t;                                /* TPIU decoder instance, in case we need it */
+    struct OFLOW oflow;                                  /* OFLOW instance, in case we need it */
 
-    uint64_t  intervalBytes;                                                 /* Number of bytes transferred in current interval */
+    struct OrbtraceIf  *o;                               /* For accessing ORBTrace devices + BMPs */
 
-    pthread_t intervalThread;                                                /* Thread reporting on intervals */
-    pthread_t processThread;                                                 /* Thread distributing to clients */
-    sem_t     dataForClients;                                                /* Semaphore counting data for clients */
-    bool      ending;                                                        /* Flag indicating app is terminating */
-    int f;                                                                   /* File handle to data source */
+    uint64_t  intervalRawBytes;                          /* Number of bytes transferred in current interval */
+    uint64_t lastInterval;                               /* Timestamp of previous interval */
 
-    int opFileHandle;                                                         /* Handle if we're writing orb output locally */
-    struct Options *options;                                                 /* Command line options (reference to above) */
+    bool      ending;                                    /* Flag indicating app is terminating */
+    bool      errored;                                   /* Flag indicating problem in reception process */
+    bool      conn;                                      /* Flag indicating that we have a good connection */
 
-    uint8_t wp;                                                              /* Read and write pointers into transfer buffers */
-    uint8_t rp;
-    struct dataBlock rawBlock[NUM_RAW_BLOCKS];                               /* Transfer buffers from the receiver */
+    int f;                                               /* File handle to data source */
 
-    uint8_t numHandlers;                                                     /* Number of TPIU channel handlers in use */
+    int opFileHandle;                                    /* Handle if we're writing orb output locally */
+    struct Options *options;                             /* Command line options (reference to above) */
+
+    struct dataBlock rawBlock[NUM_RAW_BLOCKS];           /* Transfer buffers from the receiver */
+
+    struct nwclientsHandle *oflowHandler;                /* Handle to OFLOW output handler */
+    bool usingOFLOW;                                     /* Flag that OFLOW protocol is in use from the source */
+
+    struct TagDataCount tagCount[NUM_TAGS];              /* Data carried per tag/TPIU channel */
+    int numHandlers;                                     /* Number of TPIU channel handlers in use */
     struct handlers *handler;
-    struct nwclientsHandle *n;                                               /* Link to the network client subsystem (used for non-TPIU case) */
-} _r =
-{
-    .options = &_options
+    char *sn;                                            /* Serial number for any device we've established contact with */
 };
+
+#ifdef WIN32
+    // https://stackoverflow.com/a/14388707/995351
+    #define SO_REUSEPORT SO_REUSEADDR
+#endif
+
+#define NWSERVER_HOST "localhost"                        /* Address to connect to NW Server */
+#define NWSERVER_PORT (2332)
+
+#define NUM_OFLOW_CHANNELS 0x7F
+
+#define INTERVAL_100US (100U)
+#define INTERVAL_1MS   (10*INTERVAL_100US)
+#define INTERVAL_100MS (100*INTERVAL_1MS)
+#define INTERVAL_1S    (10*INTERVAL_100MS)
+
+struct Options _options =
+{
+    .listenPort   = OFCLIENT_SERVER_PORT,
+    .nwserverHost = NWSERVER_HOST,
+    .channelList  = "1",
+};
+
+struct RunTime _r;
 
 // ====================================================================================================
 // ====================================================================================================
@@ -153,14 +177,12 @@ struct RunTime
 // ====================================================================================================
 // ====================================================================================================
 // ====================================================================================================
-static void _intHandler( int sig )
 
-{
-    /* CTRL-C exit is not an error... */
-    exit( 0 );
-}
-// ====================================================================================================
+
 #if defined(LINUX) && defined (TCGETS2)
+// ====================================================================================================
+// Linux Specific Drivers
+// ====================================================================================================
 static int _setSerialConfig ( int f, speed_t speed )
 {
     // Use Linux specific termios2.
@@ -211,7 +233,63 @@ static int _setSerialConfig ( int f, speed_t speed )
     ioctl( f, TCFLSH, TCIOFLUSH );
     return 0;
 }
+
+#elif defined WIN32
+// ====================================================================================================
+// WIN32 Specific Driver
+// ====================================================================================================
+
+static bool _setSerialSpeed( HANDLE handle, int speed )
+{
+    DCB dcb;
+    SecureZeroMemory( &dcb, sizeof( DCB ) );
+    dcb.DCBlength = sizeof( DCB );
+    BOOL ok = GetCommState( handle, &dcb );
+
+    if ( !ok )
+    {
+        return false;
+    }
+
+    dcb.BaudRate = speed;
+    dcb.ByteSize = 8;
+    dcb.Parity   = NOPARITY;
+    dcb.StopBits = ONESTOPBIT;
+
+    ok = SetCommState( handle, &dcb );
+
+    if ( !ok )
+    {
+        return false;
+    }
+
+    // Set timeouts
+    COMMTIMEOUTS timeouts;
+    ok = GetCommTimeouts( handle, &timeouts );
+
+    if ( !ok )
+    {
+        return false;
+    }
+
+    timeouts.ReadIntervalTimeout         = 0;
+    timeouts.ReadTotalTimeoutConstant    = 0;
+    timeouts.ReadTotalTimeoutMultiplier  = 0;
+    ok = SetCommTimeouts( handle, &timeouts );
+
+    if ( !ok )
+    {
+        return false;
+    }
+
+    return true;
+}
+
 #else
+// =========================================================================================================
+// Default Drivers ( OSX and Linux without TCGETS2 )
+// =========================================================================================================
+
 static int _setSerialConfig ( int f, speed_t speed )
 {
     struct termios settings;
@@ -246,57 +324,123 @@ static int _setSerialConfig ( int f, speed_t speed )
     return 0;
 }
 #endif
+
 // ====================================================================================================
 static void _doExit( void )
 
 {
     _r.ending = true;
 
-    nwclientShutdown( _r.n );
-    /* Give them a bit of time, then we're leaving anyway */
-    usleep( 200 );
-
     if ( _r.opFileHandle )
     {
         close( _r.opFileHandle );
+        _r.opFileHandle = 0;
     }
+
+    /* Need to nudge our own process in case it's stuck in a read or similar */
+    _exit( 0 );
 }
 // ====================================================================================================
-void _printHelp( char *progName )
+static void _intHandler( int sig )
+
+{
+    /* CTRL-C exit is not an error... */
+    _doExit();
+}
+// ====================================================================================================
+void _printHelp( const char *const progName, struct RunTime *r )
 
 {
     genericsPrintf( "Usage: %s [options]" EOL, progName );
-    genericsPrintf( "       -a: <serialSpeed> to use" EOL );
-    genericsPrintf( "       -e: When reading from file, terminate at end of file" EOL );
-    genericsPrintf( "       -f: <filename> Take input from specified file" EOL );
-    genericsPrintf( "       -h: This help" EOL );
-    genericsPrintf( "       -l: <port> Listen port for the incoming connections (defaults to %d)" EOL, NWCLIENT_SERVER_PORT );
-    genericsPrintf( "       -m: <interval> Output monitor information about the link at <interval>ms" EOL );
-    genericsPrintf( "       -o: <filename> to be used for dump file" EOL );
-    genericsPrintf( "       -p: <serialPort> to use" EOL );
-    genericsPrintf( "       -s: <Server>:<Port> to use" EOL );
-    genericsPrintf( "       -t: <Channel , ...> Use TPIU channels (and strip TIPU framing from output flows)" EOL );
-    genericsPrintf( "       -v: <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsPrintf( "    -a, --serial-speed:  <serialSpeed> to use" EOL );
+    genericsPrintf( "    -E, --eof:           When reading from file, terminate at end of file" EOL );
+    genericsPrintf( "    -f, --input-file:    <filename> Take input from specified file" EOL );
+    genericsPrintf( "    -h, --help:          This help" EOL );
+    genericsPrintf( "    -l, --listen-port:   <port> Listen port for incoming ORBFLOW connections (defaults to %d)" EOL, r->options->listenPort );
+    genericsPrintf( "    -m, --monitor:       <interval> Output monitor information about the link at <interval>ms, min 500ms" EOL );
+    genericsPrintf( "    -M, --no-colour:     Supress colour in output" EOL );
+    genericsPrintf( "    -n, --serial-number: <Serial> any part of serial number to differentiate specific device" EOL );
+    genericsPrintf( "    -o, --output-file:   <filename> to be used for dump file" EOL );
+    genericsPrintf( "    -O, --orbtrace:      \"<options>\" run orbtrace with specified options on device connect" EOL );
+    genericsPrintf( "    -p, --serial-port:   <serialPort> to use" EOL );
+    genericsPrintf( "    -P, --pace:          <microseconds> delay in block of data transmission to clients" EOL );
+    genericsPrintf( "    -s, --server:        <Server>:<Port> to use" EOL );
+    genericsPrintf( "    -T, --tpiu:          Strip TPIU framing from input flows (mostly not relevant)" EOL );
+    genericsPrintf( "    -t, --tag:           <stream,stream....> Legacy TPIU streams to decode and route (Default %s)" EOL, r->options->channelList );
+    genericsPrintf( "    -v, --verbose:       <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsPrintf( "    -V, --version:       Print version, connected usb devices, and exit" EOL );
 }
+
 // ====================================================================================================
-int _processOptions( int argc, char *argv[], struct RunTime *r )
+void _printVersion( struct RunTime *r )
 
 {
-    int c;
+    genericsPrintf( "orbuculum version " GIT_DESCRIBE EOL );
+    r->o = OrbtraceIfCreateContext();
+    int ndevices = OrbtraceIfGetDeviceList( r->o, NULL, DEVTYPE( DEVICE_ORBTRACE_MINI ) | DEVTYPE( DEVICE_BMP ) );
+
+    if ( !ndevices )
+    {
+        genericsPrintf( "No devices found" EOL );
+    }
+    else
+    {
+        genericsPrintf( "Device%s Found;" EOL, ( ndevices > 1 ) ? "s" : "" );
+        OrbtraceIfListDevices( r->o );
+    }
+
+    OrbtraceIfDestroyContext( r->o );
+    r->o = NULL;
+}
+// ====================================================================================================
+static struct option _longOptions[] =
+{
+    {"serial-speed", required_argument, NULL, 'a'},
+    {"eof", no_argument, NULL, 'E'},
+    {"input-file", required_argument, NULL, 'f'},
+    {"help", no_argument, NULL, 'h'},
+    {"listen-port", required_argument, NULL, 'l'},
+    {"monitor", required_argument, NULL, 'm'},
+    {"no-colour", no_argument, NULL, 'M'},
+    {"no-color", no_argument, NULL, 'M'},
+    {"serial-number", required_argument, NULL, 'n'},
+    {"output-file", required_argument, NULL, 'o'},
+    {"orbtrace", required_argument, NULL, 'O'},
+    {"serial-port", required_argument, NULL, 'p'},
+    {"pace", required_argument, NULL, 'P'},
+    {"server", required_argument, NULL, 's'},
+    {"tpiu", required_argument, NULL, 'T'},
+    {"tag", required_argument, NULL, 't'},
+    {"verbose", required_argument, NULL, 'v'},
+    {"version", no_argument, NULL, 'V'},
+    {NULL, no_argument, NULL, 0}
+};
+// ====================================================================================================
+bool _processOptions( int argc, char *argv[], struct RunTime *r )
+
+{
+    int c, optionIndex = 0;
 #define DELIMITER ','
 
-    while ( ( c = getopt ( argc, argv, "a:ef:hl:m:no:p:s:t:v:" ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "a:Ef:hVl:m:Mn:o:O:p:P:s:Tt:v:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
             case 'a':
                 r->options->speed = atoi( optarg );
                 r->options->dataSpeed = r->options->speed;
+
+                if ( r->options->speed <= 0 )
+                {
+                    genericsReport( V_ERROR, "Speed out of range" EOL );
+                    return false;
+                }
+
                 break;
 
             // ------------------------------------
 
-            case 'e':
+            case 'E':
                 r->options->fileTerminate = true;
                 break;
 
@@ -307,19 +451,51 @@ int _processOptions( int argc, char *argv[], struct RunTime *r )
 
             // ------------------------------------
             case 'h':
-                _printHelp( argv[0] );
+                _printHelp( argv[0], r );
+                return false;
+
+            // ------------------------------------
+
+            case 'V':
+                _printVersion( r );
                 return false;
 
             // ------------------------------------
 
             case 'l':
                 r->options->listenPort = atoi( optarg );
+
+                if ( ( r->options->listenPort <= 0 ) || ( r->options->listenPort > 0xffff ) )
+                {
+                    genericsReport( V_ERROR, "Port to listen on is out of range" EOL );
+                    return false;
+                }
+
                 break;
 
             // ------------------------------------
 
             case 'm':
                 r->options->intervalReportTime = atoi( optarg );
+
+                if ( r->options->intervalReportTime < 500 )
+                {
+                    genericsReport( V_ERROR, "intervalReportTime is out of range" EOL );
+                    return false;
+                }
+
+                break;
+
+            // ------------------------------------
+
+            case 'M':
+                r->options->mono = true;
+                break;
+
+            // ------------------------------------
+
+            case 'n':
+                r->options->sn = optarg;
                 break;
 
             // ------------------------------------
@@ -330,14 +506,33 @@ int _processOptions( int argc, char *argv[], struct RunTime *r )
 
             // ------------------------------------
 
+            case 'O':
+                r->options->otcl = optarg;
+                break;
+
+            // ------------------------------------
+
             case 'p':
                 r->options->port = optarg;
                 break;
 
             // ------------------------------------
 
+            case 'P':
+                r->options->paceDelay = atoi( optarg );
+
+                if ( r->options->paceDelay <= 0 )
+                {
+                    genericsReport( V_ERROR, "paceDelay is out of range" EOL );
+                    return false;
+                }
+
+                break;
+
+            // ------------------------------------
+
             case 's':
-                r->options->seggerHost = optarg;
+                r->options->nwserverHost = optarg;
 
                 // See if we have an optional port number too
                 char *a = optarg;
@@ -349,26 +544,40 @@ int _processOptions( int argc, char *argv[], struct RunTime *r )
 
                 if ( *a == ':' )
                 {
-                    *a = 0;
-                    r->options->seggerPort = atoi( ++a );
+                    r->options->nwserverPort = atoi( ++a );
                 }
 
-                if ( !r->options->seggerPort )
+                if ( !r->options->nwserverPort )
                 {
-                    r->options->seggerPort = SEGGER_PORT;
+                    r->options->nwserverPort = NWSERVER_PORT;
                 }
 
                 break;
 
             // ------------------------------------
-            case 't':
+            case 'T':
                 r->options->useTPIU = true;
+                break;
+
+            // ------------------------------------
+            case 't':
                 r->options->channelList = optarg;
                 break;
 
             // ------------------------------------
             case 'v':
-                genericsSetReportLevel( atoi( optarg ) );
+                if ( !isdigit( *optarg ) )
+                {
+                    genericsReport( V_ERROR, "-v requires a numeric argument." EOL );
+                    return false;
+                }
+
+                if ( !genericsSetReportLevel( atoi( optarg ) ) )
+                {
+                    genericsReport( V_ERROR, "Verbosity out of range" EOL );
+                    return false;
+                }
+
                 break;
 
             // ------------------------------------
@@ -393,7 +602,13 @@ int _processOptions( int argc, char *argv[], struct RunTime *r )
         }
 
     /* ... and dump the config if we're being verbose */
-    genericsReport( V_INFO, "Orbuculum V" VERSION " (Git %08X %s, Built " BUILD_DATE ")" EOL, GIT_HASH, ( GIT_DIRTY ? "Dirty" : "Clean" ) );
+    genericsReport( V_INFO, "orbuculum version " GIT_DESCRIBE EOL );
+
+    if ( r->options->port )
+    {
+        /* For the base of a UART only 8 of 10 bits contain useful data */
+        r->options->dataSpeed = ( r->options->dataSpeed * 8 ) / 10;
+    }
 
     if ( r->options->intervalReportTime )
     {
@@ -410,6 +625,11 @@ int _processOptions( int argc, char *argv[], struct RunTime *r )
         genericsReport( V_INFO, "Serial Speed   : %d baud" EOL, r->options->speed );
     }
 
+    if ( r->options->sn )
+    {
+        genericsReport( V_INFO, "Serial Number  : %s" EOL, r->options->sn );
+    }
+
     if ( r->options->dataSpeed )
     {
         genericsReport( V_INFO, "Max Data Rt    : %d bps" EOL, r->options->dataSpeed );
@@ -420,22 +640,24 @@ int _processOptions( int argc, char *argv[], struct RunTime *r )
         genericsReport( V_INFO, "Raw Output file: %s" EOL, r->options->outfile );
     }
 
-    if ( r->options->seggerPort )
+    if ( r->options->nwserverPort )
     {
-        genericsReport( V_INFO, "SEGGER H&P    : %s:%d" EOL, r->options->seggerHost, r->options->seggerPort );
+        genericsReport( V_INFO, "NW Server      : %s:%d" EOL, r->options->nwserverHost, r->options->nwserverPort );
     }
 
-    if ( r->options->useTPIU )
+    genericsReport( V_INFO, "Use/Strip TPIU : %s" EOL, r->options->useTPIU ? "True" : "False" );
+    genericsReport( V_INFO, "Decode/Forward : %s" EOL, r->options->channelList ? r->options->channelList : "None" );
+
+    if ( r->options->otcl )
     {
-        genericsReport( V_INFO, "Use/Strip TPIU : True (Channel List %s)" EOL, r->options->channelList );
+        genericsReport( V_INFO, "Orbtrace CL    : %s" EOL, r->options->otcl );
     }
-    else
-    {
-        genericsReport( V_INFO, "Use/Strip TPIU : False" EOL );
-    }
+
+    genericsReport( V_INFO, "OFLOW Port     : %d" EOL, r->options->listenPort );
 
     if ( r->options->file )
     {
+        genericsReport( V_INFO, "Pace Delay     : %dus" EOL, r->options->paceDelay );
         genericsReport( V_INFO, "Input File  : %s", r->options->file );
 
         if ( r->options->fileTerminate )
@@ -448,242 +670,371 @@ int _processOptions( int argc, char *argv[], struct RunTime *r )
         }
     }
 
-    if ( ( r->options->file ) && ( ( r->options->port ) || ( r->options->seggerPort ) ) )
+    if ( r->options->hiresTime )
     {
-        genericsReport( V_ERROR, "Cannot specify file and port or Segger at same time" EOL );
+        genericsReport( V_INFO, "High Res Time" EOL );
+    }
+
+    if ( ( r->options->file ) && ( ( r->options->port ) || ( r->options->nwserverPort ) ) )
+    {
+        genericsReport( V_ERROR, "Cannot specify file and port or NW Server at same time" EOL );
         return false;
     }
 
-    if ( ( r->options->port ) && ( r->options->seggerPort ) )
+    if ( (     r->options->paceDelay ) && ( !r->options->file ) )
     {
-        genericsReport( V_ERROR, "Cannot specify port and Segger at same time" EOL );
+        genericsReport( V_ERROR, "Pace Delay only makes sense when input is from a file" EOL );
+        return false;
+    }
+
+    if ( ( r->options->port ) && ( r->options->nwserverPort ) )
+    {
+        genericsReport( V_ERROR, "Cannot specify port and NW Server at same time" EOL );
         return false;
     }
 
     return true;
 }
 // ====================================================================================================
-void *_checkInterval( void *params )
+void _checkInterval( void *params )
 
 /* Perform any interval reporting that may be needed */
 
 {
     struct RunTime *r = ( struct RunTime * )params;
+    struct timespec ts;
+    uint64_t tnow;
     uint64_t snapInterval;
-    struct handlers *h;
+    int w;
 
-    while ( !r->ending )
+    if ( r->options->intervalReportTime )
     {
-        usleep( r->options->intervalReportTime * 1000 );
+        clock_gettime( CLOCK_REALTIME, &ts );
+        tnow = ts.tv_sec * 1000000000L + ts.tv_nsec;
 
-        /* Grab the interval and scale to 1 second */
-        snapInterval = r->intervalBytes * 1000 / r->options->intervalReportTime;
-
-        snapInterval *= 8;
-        genericsPrintf( C_PREV_LN C_CLR_LN C_DATA );
-
-        if ( snapInterval / 1000000 )
+        if ( tnow - r->lastInterval >= r->options->intervalReportTime * 1000000L )
         {
-            genericsPrintf( "%4d.%d " C_RESET "MBits/sec ", snapInterval / 1000000, ( snapInterval * 1 / 100000 ) % 10 );
-        }
-        else if ( snapInterval / 1000 )
-        {
-            genericsPrintf( "%4d.%d " C_RESET "KBits/sec ", snapInterval / 1000, ( snapInterval / 100 ) % 10 );
-        }
-        else
-        {
-            genericsPrintf( "  %4d " C_RESET " Bits/sec ", snapInterval );
-        }
+            r->lastInterval = tnow;
 
-        h = r->handler;
-        uint64_t totalDat = 0;
+            /* Grab the interval and scale to bits per 1 second */
+            snapInterval = r->intervalRawBytes * 8000L / r->options->intervalReportTime;
 
-        if ( ( r->intervalBytes ) && ( r->options->useTPIU ) )
-        {
-            for ( int chIndex = 0; chIndex < r->numHandlers; chIndex++ )
+            if ( r->conn )
             {
-                genericsPrintf( " %d:%3d%% ",  h->channel, ( h->intervalBytes * 100 ) / r->intervalBytes );
-                totalDat += h->intervalBytes;
-                /* TODO: This needs a mutex */
-                h->intervalBytes = 0;
+                genericsPrintf( C_PREV_LN C_DATA );
 
-                h++;
+                if ( snapInterval / 1000000 )
+                {
+                    genericsPrintf( "%4d.%d " C_RESET "MBits/sec ", snapInterval / 1000000, ( snapInterval * 1 / 100000 ) % 10 );
+                }
+                else if ( snapInterval / 1000 )
+                {
+                    genericsPrintf( "%4d.%d " C_RESET "KBits/sec ", snapInterval / 1000, ( snapInterval / 100 ) % 10 );
+                }
+                else
+                {
+                    genericsPrintf( "  %4d " C_RESET " Bits/sec ", snapInterval );
+                }
+
+                uint64_t totalPct = 0;
+
+                if ( r->intervalRawBytes )
+                {
+                    for ( int i = 0; i < NUM_TAGS; i++ )
+                    {
+                        w = 0;
+
+                        if ( r->tagCount[i].intervalData )
+                        {
+                            w = ( r->tagCount[i].intervalData * 1000 ) / r->intervalRawBytes;
+                            r->tagCount[i].ts = tnow;
+                            totalPct += w;
+                        }
+
+                        if ( tnow - r->tagCount[i].ts < LAST_TAG_SEEN_TIME_NS )
+                        {
+                            if ( ( !r->tagCount[i].hasHandler ) && r->options->useTPIU )
+                            {
+                                genericsPrintf( C_NOCHAN" [%d:" "%3d%%] " C_RESET,  i, w / 10 );
+                            }
+                            else
+                            {
+                                genericsPrintf( " %d:" C_DATA"%3d%% " C_RESET,  i, w / 10 );
+                            }
+                        }
+
+                        r->tagCount[i].intervalData = 0;
+                    }
+
+                    w = ( totalPct < 1000 ) ? 1000 - totalPct : 0;
+                    genericsPrintf( " Waste:" C_DATA "%2d.%01d%% " C_RESET,  w / 10, w % 10 );
+                }
+
+                if ( r->options->dataSpeed > 100 )
+                {
+                    /* Conversion to percentage done as a division to avoid overflow */
+                    uint32_t fullPercent = ( snapInterval * 100 ) / r->options->dataSpeed;
+                    genericsPrintf( "(" C_DATA " %3d%% " C_RESET "full)", ( fullPercent > 100 ) ? 100 : fullPercent );
+                }
+
+                genericsReport( V_INFO, "Ce=%d Oe=%d", OFLOWGetCOBSErrors( &_r.oflow ), OFLOWGetErrors( &_r.oflow ) );
+                genericsPrintf( "   " C_RESET C_CLR_LN EOL );
             }
 
-            genericsPrintf( " Waste:%3d%% ",  100 - ( ( totalDat * 100 ) / r->intervalBytes ) );
+            r->intervalRawBytes = 0;
         }
-
-        r->intervalBytes = 0;
-
-        if ( r->options->dataSpeed > 100 )
-        {
-            /* Conversion to percentage done as a division to avoid overflow */
-            uint32_t fullPercent = ( snapInterval * 100 ) / r->options->dataSpeed;
-            genericsPrintf( "(" C_DATA " %3d%% " C_RESET "full)", ( fullPercent > 100 ) ? 100 : fullPercent );
-        }
-
-        genericsPrintf( C_RESET EOL );
     }
-
-    return NULL;
 }
 // ====================================================================================================
-static void _purgeBlock( struct RunTime *r )
+// Block decoders and handlers for the various line formats
+// ====================================================================================================
+static void _purgeBlock( struct RunTime *r, bool createOFLOW )
+
+/* Send any packets to clients who want it, no matter where they originate from */
 
 {
-    /* Now send any packets to clients who want it */
+    struct Frame oflowOtg;
+    struct handlers *h = r->handler;
+    int i = r->numHandlers;
 
-    if ( r->options->useTPIU )
+    while ( i-- )
     {
-        struct handlers *h = r->handler;
-        int i = r->numHandlers;
-
-        while ( i-- )
+        if ( h->strippedBlock->fillLevel )
         {
-            if ( h->strippedBlock->fillLevel )
+            nwclientSend( h->n, h->strippedBlock->fillLevel, h->strippedBlock->buffer );
+
+            if ( createOFLOW )
             {
-                nwclientSend( h->n, h->strippedBlock->fillLevel, h->strippedBlock->buffer );
-                h->intervalBytes += h->strippedBlock->fillLevel;
-                h->strippedBlock->fillLevel = 0;
+                /* The OFLOW encoded version goes out on the combined OFLOW channel, with a specific channel header */
+                int j = h->strippedBlock->fillLevel;
+                const uint8_t *b = h->strippedBlock->buffer;
+
+                while ( j )
+                {
+                    OFLOWEncode( h->channel, 0, b, ( j < OFLOW_MAX_PACKET_LEN ) ? j : OFLOW_MAX_PACKET_LEN, &oflowOtg );
+                    nwclientSend( _r.oflowHandler, oflowOtg.len, oflowOtg.d );
+                    b += ( j < OFLOW_MAX_PACKET_LEN ) ? j : OFLOW_MAX_PACKET_LEN;
+                    j -= ( j < OFLOW_MAX_PACKET_LEN ) ? j : OFLOW_MAX_PACKET_LEN;
+                }
+            }
+
+            h->strippedBlock->fillLevel = 0;
+        }
+
+        h++;
+    }
+}
+// ====================================================================================================
+static void _TPIUpacketRxed( enum TPIUPumpEvent e, struct TPIUPacket *p, void *param )
+
+/* Callback for when a TPIU frame has been assembled */
+
+{
+    struct RunTime *r = ( struct RunTime * )param;
+
+    struct handlers *h = NULL;
+    int cachedChannel = -1;
+    int chIndex = 0;
+
+    switch ( e )
+    {
+        case TPIU_EV_RXEDPACKET:
+
+            /* Iterate through the packet, putting it into the correct output buffers */
+            for ( uint32_t g = 0; g < p->len; g++ )
+            {
+                if ( cachedChannel != p->packet[g].s )
+                {
+                    /* Whatever happens, cache this result */
+                    cachedChannel = p->packet[g].s;
+
+                    /* Search for channel */
+                    h = r->handler;
+
+                    for ( chIndex = 0; chIndex < r->numHandlers; chIndex++ )
+                    {
+                        if ( h->channel == p->packet[g].s )
+                        {
+                            break;
+                        }
+
+                        h++;
+                    }
+                }
+
+                r->tagCount[p->packet[g].s].totalData++;
+                r->tagCount[p->packet[g].s].intervalData++;
+
+                if ( ( chIndex != r->numHandlers ) && ( h ) )
+                {
+                    /* We must have found a match for this at some point, so add it to the queue */
+                    h->strippedBlock->buffer[h->strippedBlock->fillLevel++] = p->packet[g].d;
+                }
+                else
+                {
+                    genericsReport( V_DEBUG, "No handler for tag %d" EOL, p->packet[g].s );
+                }
+            }
+
+            break;
+
+        case TPIU_EV_ERROR:
+            genericsReport( V_WARN, "****ERROR****%s" EOL, ( r->options->intervalReportTime ) ? EOL : "" );
+            break;
+
+        case TPIU_EV_NEWSYNC:
+        case TPIU_EV_SYNCED:
+        case TPIU_EV_RXING:
+        case TPIU_EV_NONE:
+        case TPIU_EV_UNSYNCED:
+        default:
+            break;
+    }
+}
+// ====================================================================================================
+
+static void _OFLOWpacketRxed( struct OFLOWFrame *p, void *param )
+
+/* OFLOW packet received, account for it and reflect it to legacy buffers if needed */
+
+{
+    int chIndex;
+    struct RunTime *r = ( struct RunTime * )param;
+    struct handlers *h = _r.handler;
+
+    if ( !p->good )
+    {
+        genericsReport( V_INFO, "Bad packet received" EOL );
+    }
+    else if ( ( r->options->useTPIU ) && ( h->channel == DEFAULT_ITM_STREAM ) )
+    {
+        /* Deal with the bizzare combination of OFLOW and TPIU in channel 1 */
+        /* Accounting will be done in TPIUPump */
+        TPIUPump( &r->t, p->d, p->len, _TPIUpacketRxed, r );
+    }
+    else
+    {
+        /* Account for this reception */
+        r->tagCount[p->tag].totalData += p->len;
+        r->tagCount[p->tag].intervalData += p->len;
+
+        /* Search for channel */
+        for ( chIndex = 0; chIndex < r->numHandlers; chIndex++ )
+        {
+            if ( h->channel == p->tag )
+            {
+                break;
             }
 
             h++;
         }
-    }
-}
-// ====================================================================================================
-static void _stripTPIU( struct RunTime *r, uint8_t *c, int bytes )
 
-{
-    struct TPIUPacket p;
-
-    struct handlers *h = NULL;
-    int cachedChannel;
-    int chIndex = 0;
-
-    cachedChannel = -1;
-
-    while ( bytes-- )
-    {
-        switch ( TPIUPump( &r->t, *c++ ) )
+        if ( ( chIndex != r->numHandlers ) && ( h ) )
         {
-            case TPIU_EV_RXEDPACKET:
-                if ( !TPIUGetPacket( &r->t, &p ) )
-                {
-                    genericsReport( V_WARN, "TPIUGetPacket fell over" EOL );
-                }
-
-                /* Iterate through the packet, putting it into the correct output buffers */
-                for ( uint32_t g = 0; g < p.len; g++ )
-                {
-                    if ( cachedChannel != p.packet[g].s )
-                    {
-                        /* Whatever happens, cache this result */
-                        cachedChannel = p.packet[g].s;
-
-                        /* Search for channel */
-                        h = r->handler;
-
-                        for ( chIndex = 0; chIndex < r->numHandlers; chIndex++ )
-                        {
-                            if ( h->channel == p.packet[g].s )
-                            {
-                                break;
-                            }
-
-                            h++;
-                        }
-                    }
-
-                    if ( chIndex != r->numHandlers )
-                    {
-                        /* We must have found a match for this at some point, so add it to the queue */
-                        h->strippedBlock->buffer[h->strippedBlock->fillLevel++] = p.packet[g].d;
-                    }
-                }
-
-                break;
-
-            case TPIU_EV_ERROR:
-                genericsReport( V_WARN, "****ERROR****" EOL );
-                break;
-
-            case TPIU_EV_NEWSYNC:
-            case TPIU_EV_SYNCED:
-            case TPIU_EV_RXING:
-            case TPIU_EV_NONE:
-            case TPIU_EV_UNSYNCED:
-            default:
-                break;
-        }
-    }
-}
-// ====================================================================================================
-static void *_processBlocks( void *params )
-/* Generic block processor for received data */
-
-{
-    struct RunTime *r = ( struct RunTime * )params;
-
-    while ( !r->ending )
-    {
-        sem_wait( &r->dataForClients );
-
-        if ( r->rp != r->wp )
-        {
-            genericsReport( V_DEBUG, "RXED Packet of %d bytes" EOL, r->rawBlock[r->rp].fillLevel );
-
-            if ( r->rawBlock[r->rp].fillLevel )
+            /* We must have found a match for this at some point, so add it to the queue */
+            for ( int i = 0; i < p->len; i++ )
             {
-                /* Account for this reception */
-                r->intervalBytes += r->rawBlock[r->rp].fillLevel;
+                h->strippedBlock->buffer[h->strippedBlock->fillLevel++] = p->d[i];
 
-#ifdef DUMP_BLOCK
-                uint8_t *c = r->rawBlock[r->rp].buffer;
-                uint32_t y = r->rawBlock[r->rp].fillLevel;
-
-                fprintf( stderr, EOL );
-
-                while ( y-- )
+                if ( h->strippedBlock->fillLevel == sizeof( h->strippedBlock->buffer ) )
                 {
-                    fprintf( stderr, "%02X ", *c++ );
-
-                    if ( !( y % 16 ) )
-                    {
-                        fprintf( stderr, EOL );
-                    }
-                }
-
-#endif
-
-                if ( _r.opFileHandle )
-                {
-                    if ( write( _r.opFileHandle, r->rawBlock[r->rp].buffer, r->rawBlock[r->rp].fillLevel ) < 0 )
-                    {
-                        genericsExit( -3, "Writing to file failed" EOL );
-                    }
-                }
-
-                if ( r-> options->useTPIU )
-                {
-                    /* Strip the TPIU framing from this input */
-                    _stripTPIU( r, r->rawBlock[r->rp].buffer, r->rawBlock[r->rp].fillLevel );
-                    _purgeBlock( r );
-                }
-                else
-                {
-                    /* Do it the old fashioned way and send out the unfettered block */
-                    nwclientSend( _r.n, r->rawBlock[r->rp].fillLevel, r->rawBlock[r->rp].buffer );
+                    /* We filled this block...better send it right now */
+                    nwclientSend( h->n, h->strippedBlock->fillLevel, h->strippedBlock->buffer );
+                    h->strippedBlock->fillLevel = 0;
                 }
             }
-
-            r->rp = ( r->rp + 1 ) % NUM_RAW_BLOCKS;
         }
     }
-
-    return NULL;
 }
 
+// ====================================================================================================
+
+static void _processNonOFLOWBlock( struct RunTime *r, ssize_t fillLevel, uint8_t *buffer )
+
+/* Not an OFLOW block, so might be TPIU or clean ITM...deal with both */
+
+{
+    struct Frame oflowOtg;
+
+    if ( fillLevel )
+    {
+        if ( r-> options->useTPIU )
+        {
+            /* Strip the TPIU framing from this input */
+            TPIUPump( &r->t, buffer, fillLevel, _TPIUpacketRxed, r );
+        }
+        else
+        {
+            /* Not TPIU ... need to assume this is ITM on the first channel..and assume it's present */
+            r->tagCount[DEFAULT_ITM_STREAM].totalData += fillLevel;
+            r->tagCount[DEFAULT_ITM_STREAM].intervalData += fillLevel;
+
+            if ( r->handler )
+            {
+                nwclientSend( r->handler->n, fillLevel, buffer );
+            }
+
+            /* The OFLOW encoded version goes out on the default OFLOW channel */
+            uint8_t *b = buffer;
+
+            while ( fillLevel )
+            {
+                OFLOWEncode( DEFAULT_ITM_STREAM, 0, b,
+                             ( fillLevel < OFLOW_MAX_PACKET_LEN ) ? fillLevel : OFLOW_MAX_PACKET_LEN,
+                             &oflowOtg );
+                nwclientSend( r->oflowHandler, oflowOtg.len, oflowOtg.d );
+                b += ( fillLevel < OFLOW_MAX_PACKET_LEN ) ? fillLevel : OFLOW_MAX_PACKET_LEN;
+                fillLevel -= ( fillLevel < OFLOW_MAX_PACKET_LEN ) ? fillLevel : OFLOW_MAX_PACKET_LEN;
+            }
+        }
+    }
+}
+// ====================================================================================================
+static void _handleBlock( struct RunTime *r, ssize_t fillLevel, uint8_t *buffer )
+
+/* Handle an incoming block from any source in either 'conventional' or orbflow format */
+
+{
+    if ( fillLevel )
+    {
+        genericsReport( V_DEBUG, "RXED Packet of %d bytes%s" EOL, fillLevel, ( r->options->intervalReportTime ) ? EOL : "" );
+
+        if ( r->opFileHandle )
+        {
+            if ( write( r->opFileHandle, buffer, fillLevel ) <= 0 )
+            {
+                genericsExit( -3, "Writing to file failed" EOL );
+            }
+        }
+
+        if ( r->usingOFLOW )
+        {
+            /* We need to decode this so we can get the stats out of it, and to reflect it out */
+            OFLOWPump( &r->oflow, buffer, fillLevel, _OFLOWpacketRxed, r );
+
+            /* ...and reflect this packet to the outgoing OFLOW channels, if we don't need to reconstruct them */
+            if ( !r->options->useTPIU )
+            {
+                nwclientSend( r->oflowHandler, fillLevel, buffer );
+            }
+        }
+        else
+        {
+            _processNonOFLOWBlock( r, fillLevel, buffer );
+        }
+
+        r->intervalRawBytes += fillLevel;
+
+        /* Send the block to clients, but only send OFLOW if it wasn't OFLOW already */
+        /* or if we're decoding TPIU in the default tag */
+        _purgeBlock( r, ( !r->usingOFLOW ) || r->options->useTPIU );
+    }
+
+    _checkInterval( r );
+}
+
+// ====================================================================================================
+// Generic handlers for each of the source types. These all call _handleBlock above to process.
 // ====================================================================================================
 static void _usb_callback( struct libusb_transfer *t )
 
@@ -691,266 +1042,328 @@ static void _usb_callback( struct libusb_transfer *t )
 
 {
     /* Whatever the status that comes back, there may be data... */
-    if ( t->actual_length > 0 )
-    {
-        _r.intervalBytes += t->actual_length;
+    _handleBlock( &_r, t->actual_length, t->buffer );
 
-        if ( _r.opFileHandle )
+    if ( ( t->status != LIBUSB_TRANSFER_COMPLETED ) &&
+            ( t->status != LIBUSB_TRANSFER_TIMED_OUT ) &&
+            ( t->status != LIBUSB_TRANSFER_CANCELLED )
+       )
+    {
+        if ( !_r.errored )
         {
-            if ( write( _r.opFileHandle, t->buffer, t->actual_length ) < 0 )
-            {
-                genericsExit( -4, "Writing to file failed (%s)" EOL, strerror( errno ) );
-            }
+            genericsReport( V_WARN, "Errored out with status %d (%s)" EOL, t->status, libusb_error_name( t->status ) );
         }
 
-
-        if ( _r.options->useTPIU )
+        _r.errored = true;
+    }
+    else
+    {
+        if ( t->status != LIBUSB_TRANSFER_CANCELLED )
         {
-            /* Strip the TPIU framing from this input */
-            _stripTPIU( &_r, t->buffer, t->actual_length );
-            _purgeBlock( &_r );
+            libusb_submit_transfer( t );
+        }
+    }
+}
+
+// ====================================================================================================
+
+void _actionOrbtraceCommand( struct RunTime *r, char *sn, enum ORBTraceDevice d )
+
+/* There is an orbtrace command line to be executed as part of the probe connect process */
+
+{
+    char commandLine[MAX_LINE_LEN];
+
+    /* If we have any configuration to do on this device, go ahead */
+    if ( r->options->otcl )
+    {
+        if ( getenv( ORBTRACEENVNAME ) )
+        {
+            snprintf( commandLine, MAX_LINE_LEN, "%s %s %s %s", getenv( ORBTRACEENVNAME ), r->options->otcl, sn ? ( ( d == DEVICE_ORBTRACE_MINI ) ? "-n " : "-s " ) : "", sn ? sn : "" );
         }
         else
         {
-            /* Do it the old fashioned way and send out the unfettered block */
-            nwclientSend( _r.n, t->actual_length, t->buffer );
+            char *baseDirectory = genericsGetBaseDirectory( );
+
+            if ( !baseDirectory )
+            {
+                genericsExit( -1, "Failed to establish base directory" EOL );
+            }
+
+            snprintf( commandLine, MAX_LINE_LEN, "%s" ORBTRACE " %s %s %s", baseDirectory, r->options->otcl, sn ? ( ( d == DEVICE_ORBTRACE_MINI ) ? "-n " : "-s " ) : "", sn ? sn : "" );
+            free( baseDirectory );
+        }
+
+        genericsReport( V_INFO, "%s" EOL, commandLine );
+
+        if (  system( commandLine ) )
+        {
+            genericsReport( V_ERROR, "Invoking orbtrace failed" EOL );
         }
     }
-
-    libusb_submit_transfer( t );
 }
+
 // ====================================================================================================
-int usbFeeder( struct RunTime *r )
+static int _usbFeeder( struct RunTime *r )
+
+/* Setup USB transfers from an ORBTrace or BMP */
 
 {
-    libusb_device_handle *handle = NULL;
-    libusb_device *dev;
-    const struct deviceList *p;
-    uint8_t iface;
-    uint8_t ep;
-    uint8_t altsetting = 0;
-    uint8_t num_altsetting = 0;
-    int32_t err;
+    bool firstRunThrough = true;
+    int workingDev;
+
+    /* Copy any part serial number across */
+    if ( r->options->sn )
+    {
+        r->sn = strdup( r->options->sn );
+    }
 
     while ( !r->ending )
     {
-        if ( libusb_init( NULL ) < 0 )
+        r->errored = false;
+
+        /* ...just in case we had a context */
+        OrbtraceIfDestroyContext( r->o );
+        r->o = OrbtraceIfCreateContext();
+        assert( r->o );
+
+        while ( 0 == OrbtraceIfGetDeviceList( r->o, r->sn, DEVTYPE_ALL ) )
         {
-            genericsReport( V_ERROR, "Failed to initalise USB interface" EOL );
-            return ( -1 );
+            usleep( INTERVAL_1S );
         }
 
-        /* Snooze waiting for the device to appear .... this is useful for when they come and go */
-        while ( 1 )
+        genericsReport( V_INFO, "Found device" EOL );
+        workingDev = OrbtraceIfSelectDevice( r->o );
+
+        if ( !OrbtraceIfOpenDevice( r->o, workingDev ) )
         {
-            p = _deviceList;
+            genericsReport( V_INFO, "Couldn't open device" EOL );
+            break;
+        }
 
-            while ( p->vid != 0 )
+        /* Take a record of what device we're using...we'll use that next time around to re-connect */
+        if ( r->sn )
+        {
+            free( r->sn );
+        }
+
+        r->sn = strdup( OrbtraceIfGetSN( r->o, workingDev ) );
+
+        /* Before we open, perform any orbtrace configuration that is needed */
+        _actionOrbtraceCommand( r, r->sn, OrbtraceIfGetDevtype( r->o, workingDev ) );
+
+        if ( !OrbtraceGetIfandEP( r->o ) )
+        {
+            genericsReport( V_INFO, "Couldn't get IF and EP" EOL );
+            break;
+        }
+
+        r->usingOFLOW = OrbtraceSupportsOFLOW( r->o );
+
+        if ( r->usingOFLOW )
+        {
+            genericsReport( V_INFO, "Orbtrace supports ORBFLOW protocol" EOL );
+
+            if ( r->options->useTPIU )
             {
-                genericsReport( V_DEBUG, "Looking for %s (%04x:%04x)" EOL, p->name, p->vid, p->pid );
+                genericsReport( V_WARN, "TPIU decoding specified, but ORBTrace supports ORBFLOW, are you sure?" EOL );
+            }
 
-                if ( ( handle = libusb_open_device_with_vid_pid( NULL, p->vid, p->pid ) ) )
+            if ( firstRunThrough && _r.opFileHandle )
+            {
+                if ( write( _r.opFileHandle, OFLOW_SIG, OFLOW_SIG_LEN ) < 0 )
                 {
-                    break;
-                }
-
-                p++;
-            }
-
-            if ( handle )
-            {
-                break;
-            }
-
-            /* Take a pause before looking again */
-            usleep( 500000 );
-        }
-
-        genericsReport( V_INFO, "Found %s" EOL, p->name );
-
-        if ( !( dev = libusb_get_device( handle ) ) )
-        {
-            /* We didn't get the device, so try again in a while */
-            continue;
-        }
-
-        iface = p->iface;
-        ep = p->ep;
-
-        if ( p->autodiscover )
-        {
-            genericsReport( V_DEBUG, "Searching for trace interface" EOL );
-
-            struct libusb_config_descriptor *config;
-
-            if ( ( err = libusb_get_active_config_descriptor( dev, &config ) ) < 0 )
-            {
-                genericsReport( V_WARN, "Failed to get config descriptor (%d)" EOL, err );
-                continue;
-            }
-
-            bool interface_found = false;
-
-            for ( int if_num = 0; if_num < config->bNumInterfaces && !interface_found; if_num++ )
-            {
-                for ( int alt_num = 0; alt_num < config->interface[if_num].num_altsetting && !interface_found; alt_num++ )
-                {
-                    const struct libusb_interface_descriptor *i = &config->interface[if_num].altsetting[alt_num];
-
-                    if (
-                                i->bInterfaceClass != 0xff ||
-                                i->bInterfaceSubClass != 0x54 ||
-                                ( i->bInterfaceProtocol != 0x00 && i->bInterfaceProtocol != 0x01 ) ||
-                                i->bNumEndpoints != 0x01 )
-                    {
-                        continue;
-                    }
-
-                    iface = i->bInterfaceNumber;
-                    altsetting = i->bAlternateSetting;
-                    num_altsetting = config->interface[if_num].num_altsetting;
-                    ep = i->endpoint[0].bEndpointAddress;
-
-                    genericsReport( V_DEBUG, "Found interface %#x with altsetting %#x and ep %#x" EOL, iface, altsetting, ep );
-
-                    interface_found = true;
+                    genericsExit( -4, "Could not write OFLOW signature to file (%s)" EOL, strerror( errno ) );
                 }
             }
 
-            if ( !interface_found )
-            {
-                genericsReport( V_DEBUG, "No supported interfaces found, falling back to hardcoded values" EOL );
-            }
-
-            libusb_free_config_descriptor( config );
+            /* We only attempt to write the file header on the first run through */
+            firstRunThrough = false;
         }
-
-        if ( ( err = libusb_claim_interface ( handle, iface ) ) < 0 )
+        else
         {
-            genericsReport( V_WARN, "Failed to claim interface (%d)" EOL, err );
-            continue;
-        }
-
-        if ( num_altsetting > 1 && ( err = libusb_set_interface_alt_setting ( handle, iface, altsetting ) ) < 0 )
-        {
-            genericsReport( V_WARN, "Failed to set altsetting (%d)" EOL, err );
+            genericsReport( V_INFO, "Orbtrace supports legacy protocol" EOL );
         }
 
         genericsReport( V_DEBUG, "USB Interface claimed, ready for data" EOL );
 
-        for ( uint32_t t = 0; t < NUM_RAW_BLOCKS; t++ )
+        /* Create the USB transfer blocks .. if we are connected depends on if there was an error submitting the requests */
+        r->errored = !( r->conn = OrbtraceIfSetupTransfers( r->o, r->options->hiresTime, r->rawBlock, NUM_RAW_BLOCKS, _usb_callback ) );
+
+        /* =========================== The main dispatch loop ======================================= */
+        while ( ( !r->ending )  && ( !r->errored ) )
         {
-            r->rawBlock[t].usbtfr = libusb_alloc_transfer( 0 );
+            int ret =   OrbtraceIfHandleEvents( r->o );
 
-            libusb_fill_bulk_transfer ( r->rawBlock[t].usbtfr, handle, ep,
-                                        r->rawBlock[t].buffer,
-                                        TRANSFER_SIZE,
-                                        _usb_callback,
-                                        &r->rawBlock[t].usbtfr,
-                                        BLOCK_TIMEOUT_INTERVAL_MS
-                                      );
-
-            int ret = libusb_submit_transfer( r->rawBlock[t].usbtfr );
-
-            if ( ret )
-            {
-                genericsReport( V_ERROR, "Error submitting USB requests %d" EOL, ret );
-                _doExit();
-            }
-        }
-
-        while ( !r->ending )
-        {
-            int ret = libusb_handle_events_completed( NULL, ( int * )&r->ending );
-
-            if ( ret )
+            if ( ( ret ) && ( ret != LIBUSB_ERROR_INTERRUPTED ) )
             {
                 genericsReport( V_ERROR, "Error waiting for USB requests to complete %d" EOL, ret );
-                _doExit();
             }
+
         }
 
-        libusb_close( handle );
+        /* ========================================================================================= */
+
+        r->conn = false;
+
+        /* Remove transfers from list and release the memory */
+        OrbtraceIfCloseTransfers( r->o );
+
+        if ( !r->ending )
+        {
+            genericsReport( V_INFO, "USB connection lost" EOL );
+        }
+
         genericsReport( V_INFO, "USB Interface closed" EOL );
     }
 
     return 0;
 }
 // ====================================================================================================
-int seggerFeeder( struct RunTime *r )
+
+static int _nwserverFeeder( struct RunTime *r )
+
+/* Setup network based transfers (typically used for things like J-Link but can also be a legacy orbuculum session */
 
 {
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
+    struct dataBlock *rxBlock = &r->rawBlock[0];
 
-    int flag = 1;
-
-    bzero( ( char * ) &serv_addr, sizeof( serv_addr ) );
-    server = gethostbyname( r->options->seggerHost );
-
-    if ( !server )
+    while ( true )
     {
-        genericsReport( V_ERROR, "Cannot find host" EOL );
-        return -1;
-    }
+        struct Stream *stream = streamCreateSocket( r->options->nwserverHost, r->options->nwserverPort );
 
-    serv_addr.sin_family = AF_INET;
-    bcopy( ( char * )server->h_addr,
-           ( char * )&serv_addr.sin_addr.s_addr,
-           server->h_length );
-    serv_addr.sin_port = htons( r->options->seggerPort );
-
-    while ( !r->ending )
-    {
-        r->f = socket( AF_INET, SOCK_STREAM, 0 );
-        setsockopt( r->f, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof( flag ) );
-
-        if ( r->f < 0 )
+        if ( stream == NULL )
         {
-            genericsReport( V_ERROR, "Error creating socket" EOL );
-            return -1;
+            continue;
         }
 
-        while ( ( !r->ending ) && ( connect( r->f, ( struct sockaddr * ) &serv_addr, sizeof( serv_addr ) ) < 0 ) )
-        {
-            usleep( 500000 );
-        }
+        genericsReport( V_INFO, "Established NW Server Link" EOL );
 
-        if ( r->ending )
-        {
-            break;
-        }
-
-        genericsReport( V_INFO, "Established Segger Link" EOL );
+        r->conn = true;
 
         while ( !r->ending )
-
         {
-            struct dataBlock *rxBlock = &r->rawBlock[r->wp];
+            size_t fl;
+            enum ReceiveResult result = stream->receive( stream, rxBlock->buffer, USB_TRANSFER_SIZE, NULL, &fl );
+            rxBlock->fillLevel = fl;
 
-            if ( ( rxBlock->fillLevel = read( r->f, rxBlock->buffer, TRANSFER_SIZE ) ) <= 0 )
+            if ( result != RECEIVE_RESULT_OK )
             {
                 break;
             }
 
-            r->wp = ( r->wp + 1 ) % NUM_RAW_BLOCKS;
-            sem_post( &r->dataForClients );
+            _handleBlock( r, rxBlock->fillLevel, rxBlock->buffer );
         }
 
-        close( r->f );
+        if ( !r->ending )
+        {
+            genericsReport( V_INFO, "Lost NW Server Link" EOL );
+        }
+
+        r->conn = false;
+        free( stream );
+    }
+
+    return 0;
+}
+// ====================================================================================================
+
+
+#ifdef WIN32
+// ====================================================================================================
+// WIN32 Specific Driver
+// ====================================================================================================
+
+static int _serialFeeder( struct RunTime *r )
+{
+    char portPath[MAX_PATH] = { 0 };
+    snprintf( portPath, sizeof( portPath ), "\\\\.\\%s", r->options->port );
+
+    while ( !r->ending )
+    {
+        HANDLE portHandle = CreateFile( portPath,
+                                        GENERIC_READ,
+                                        0,      //  must be opened with exclusive-access
+                                        NULL,   //  default security attributes
+                                        OPEN_EXISTING, //  must use OPEN_EXISTING
+                                        0,    //  not overlapped I/O
+                                        NULL ); //  hTemplate must be NULL for comm devices
+
+        if ( portHandle == INVALID_HANDLE_VALUE )
+        {
+            genericsExit( 1, "Can't open serial port" EOL );
+        }
+
+        genericsReport( V_INFO, "Port opened" EOL );
+
+        if ( !_setSerialSpeed( portHandle, r->options->speed ) )
+        {
+            genericsExit( 2, "setSerialConfig failed" EOL );
+        }
+
+        SetCommMask( portHandle, EV_RXCHAR );
+
+        genericsReport( V_INFO, "Port configured" EOL );
+
+        r->conn = true;
+
+        while ( !r->ending )
+        {
+            DWORD eventMask = 0;
+            WaitCommEvent( portHandle, &eventMask, NULL );
+            DWORD unused;
+            COMSTAT stats;
+            ClearCommError( portHandle, &unused, &stats );
+
+            if ( stats.cbInQue == 0 )
+            {
+                continue;
+            }
+
+            struct dataBlock *rxBlock = &r->rawBlock[0];
+
+            DWORD transferSize = stats.cbInQue;
+
+            if ( transferSize > USB_TRANSFER_SIZE )
+            {
+                transferSize = USB_TRANSFER_SIZE;
+            }
+
+            ReadFile( portHandle, rxBlock->buffer, transferSize, &rxBlock->fillLevel, NULL );
+
+            if ( rxBlock->fillLevel <= 0 )
+            {
+                break;
+            }
+
+            _handleBlock( r, rxBlock->fillLevel, rxBlock->buffer );
+        }
+
+        r->conn = false;
 
         if ( ! r->ending )
         {
-            genericsReport( V_INFO, "Lost Segger Link" EOL );
+            genericsReport( V_INFO, "Read failed" EOL );
         }
+
+        CloseHandle( portHandle );
     }
 
-    return -2;
+    return 0;
 }
-// ====================================================================================================
-int serialFeeder( struct RunTime *r )
+
+#else
+// =========================================================================================================
+// Default Driver ( OSX and Linux )
+// =========================================================================================================
+
+static int _serialFeeder( struct RunTime *r )
+
+/* Setup incoming feed from a serial port */
+
 {
     int ret;
+    struct dataBlock *rxBlock = &r->rawBlock[0];
 
     while ( !r->ending )
     {
@@ -963,7 +1376,7 @@ int serialFeeder( struct RunTime *r )
 #endif
         {
             genericsReport( V_WARN, "Can't open serial port" EOL );
-            usleep( 500000 );
+            usleep( INTERVAL_100MS );
         }
 
         genericsReport( V_INFO, "Port opened" EOL );
@@ -990,18 +1403,19 @@ int serialFeeder( struct RunTime *r )
             genericsExit( ret, "setSerialConfig failed" EOL );
         }
 
+        r->conn = true;
+
         while ( !r->ending )
         {
-            struct dataBlock *rxBlock = &r->rawBlock[r->wp];
-
-            if ( ( rxBlock->fillLevel = read( r->f, rxBlock->buffer, TRANSFER_SIZE ) ) <= 0 )
+            if ( ( rxBlock->fillLevel = read( r->f, rxBlock->buffer, USB_TRANSFER_SIZE ) ) <= 0 )
             {
                 break;
             }
 
-            r->wp = ( r->wp + 1 ) % NUM_RAW_BLOCKS;
-            sem_post( &r->dataForClients );
+            _handleBlock( r, rxBlock->fillLevel, rxBlock->buffer );
         }
+
+        r->conn = false;
 
         if ( ! r->ending )
         {
@@ -1013,20 +1427,37 @@ int serialFeeder( struct RunTime *r )
 
     return 0;
 }
+#endif
+
 // ====================================================================================================
-int fileFeeder( struct RunTime *r )
+static int _fileFeeder( struct RunTime *r )
+
+/* Setup incoming data stream from a file in either legacy or OFLOW format */
 
 {
+    struct dataBlock *rxBlock = &r->rawBlock[0];
+
+
     if ( ( r->f = open( r->options->file, O_RDONLY ) ) < 0 )
     {
         genericsExit( -4, "Can't open file %s" EOL, r->options->file );
     }
 
+    r->conn = true;
+
+    /* Start off by checking if this is OFLOW formatted */
+    rxBlock->fillLevel = read( r->f, rxBlock->buffer, OFLOW_SIG_LEN );
+    r->usingOFLOW = ( ( OFLOW_SIG_LEN == rxBlock->fillLevel ) && ( !strncmp( OFLOW_SIG, ( char * )rxBlock->buffer, OFLOW_SIG_LEN ) ) );
+    genericsReport( V_INFO, "File is %sin OFLOW format" EOL, ( r->usingOFLOW ) ? "" : "not " );
+
+    if ( r->usingOFLOW )
+    {
+        /* This is OFLOW, so we need to read the first data after the header */
+        rxBlock->fillLevel = read( r->f, rxBlock->buffer, USB_TRANSFER_SIZE );
+    }
+
     while ( !r->ending )
     {
-        struct dataBlock *rxBlock = &r->rawBlock[r->wp];
-        rxBlock->fillLevel = read( r->f, rxBlock->buffer, TRANSFER_SIZE );
-
         if ( !rxBlock->fillLevel )
         {
             if ( r->options->fileTerminate )
@@ -1036,14 +1467,22 @@ int fileFeeder( struct RunTime *r )
             else
             {
                 // Just spin for a while to avoid clogging the CPU
-                usleep( 100000 );
+                usleep( INTERVAL_100MS );
                 continue;
             }
         }
 
-        r->wp = ( r->wp + 1 ) % NUM_RAW_BLOCKS;
-        sem_post( &r->dataForClients );
+        _handleBlock( r, rxBlock->fillLevel, rxBlock->buffer );
+
+        if ( r->options->paceDelay )
+        {
+            usleep( r->options->paceDelay );
+        }
+
+        rxBlock->fillLevel = read( r->f, rxBlock->buffer, USB_TRANSFER_SIZE );
     }
+
+    r->conn = false;
 
     if ( !r->options->fileTerminate )
     {
@@ -1054,18 +1493,40 @@ int fileFeeder( struct RunTime *r )
     return true;
 }
 // ====================================================================================================
+// ====================================================================================================
+// ====================================================================================================
+// Publicly available routines
+// ====================================================================================================
+// ====================================================================================================
+// ====================================================================================================
+
 int main( int argc, char *argv[] )
 
 {
-    /* Setup TPIU in case we call it into service later */
-    TPIUDecoderInit( &_r.t );
-    sem_init( &_r.dataForClients, 0, 0 );
+    struct timespec ts;
+
+    /* This is set here to avoid huge .data section in startup image */
+    _r.options = &_options;
+
+#ifdef WIN32
+    WSADATA wsaData;
+    WSAStartup( MAKEWORD( 2, 2 ), &wsaData );
+#endif
 
     if ( !_processOptions( argc, argv, &_r ) )
     {
         /* processOptions generates its own error messages */
         genericsExit( -1, "" EOL );
     }
+
+    if ( _r.options->useTPIU )
+    {
+        TPIUDecoderInit( &_r.t );
+    }
+
+    OFLOWInit( &_r.oflow );
+
+    genericsScreenHandling( !_r.options->mono );
 
     /* Make sure the network clients get removed at the end */
     atexit( _doExit );
@@ -1077,13 +1538,18 @@ int main( int argc, char *argv[] )
     }
 
     /* Don't kill a sub-process when any reader or writer evaporates */
+#if !defined WIN32
+
     if ( SIG_ERR == signal( SIGPIPE, SIG_IGN ) )
     {
         genericsExit( -1, "Failed to ignore SIGPIPEs" EOL );
     }
 
-    if ( _r.options->useTPIU )
+#endif
+
+    if ( _r.options->channelList )
     {
+        /* Channel list is only needed for legacy ports that we are re-exporting (i.e. clean unencapsulated flows) */
         char *c = _r.options->channelList;
         int x = 0;
 
@@ -1107,7 +1573,7 @@ int main( int argc, char *argv[] )
             if ( x )
             {
                 /* This is a good number, so open */
-                if ( ( x < 0 ) || ( x >= NUM_TPIU_CHANNELS ) )
+                if ( ( x < 0 ) || ( x >= NUM_OFLOW_CHANNELS ) )
                 {
                     genericsExit( -1, "Channel number out of range" EOL );
                 }
@@ -1116,28 +1582,23 @@ int main( int argc, char *argv[] )
 
                 _r.handler[_r.numHandlers].channel = x;
                 _r.handler[_r.numHandlers].strippedBlock = ( struct dataBlock * )calloc( 1, sizeof( struct dataBlock ) );
-                _r.handler[_r.numHandlers].n = nwclientStart(  _r.options->listenPort + _r.numHandlers );
-                genericsReport( V_WARN, "Started Network interface for channel %d on port %d" EOL, x, _r.options->listenPort + _r.numHandlers );
+                _r.tagCount[x].hasHandler = true;
+                _r.handler[_r.numHandlers].n = nwclientStart(  _r.options->listenPort + LEGACY_SERVER_PORT_OFS + _r.numHandlers );
+                genericsReport( V_INFO, "Will decode tag %d, exported Legacy interface on port %d" EOL, x, _r.options->listenPort + LEGACY_SERVER_PORT_OFS + _r.numHandlers );
+
                 _r.numHandlers++;
                 x = 0;
             }
         }
     }
-    else
-    {
-        if ( !( _r.n = nwclientStart( _r.options->listenPort ) ) )
-        {
-            genericsExit( -1, "Failed to make network server" EOL );
-        }
-    }
 
-    if ( _r.options->intervalReportTime )
-    {
-        pthread_create( &_r.intervalThread, NULL, &_checkInterval, &_r );
-    }
+    /* The OFLOW handler doesn't need a channel list ... it works on all channels */
+    _r.oflowHandler = nwclientStart( _r.options->listenPort );
+    genericsReport( V_INFO, "Started Network interface for OFLOW on port %d" EOL, _r.options->listenPort );
 
-    /* Now start the distribution task */
-    pthread_create( &_r.processThread, NULL, &_processBlocks, &_r );
+    /* Don't do anything with interval times for at least the first interval time */
+    clock_gettime( CLOCK_REALTIME, &ts );
+    _r.lastInterval = ts.tv_sec * 1000000000L + ts.tv_nsec;
 
     if ( _r.options->outfile )
     {
@@ -1150,21 +1611,28 @@ int main( int argc, char *argv[] )
         }
     }
 
-    if ( _r.options->seggerPort )
+    /* Blank line for tidyness' sake */
+    genericsPrintf( EOL );
+
+    if ( ( _r.options->nwserverPort ) || ( _r.options->port ) || ( _r.options->file ) )
     {
-        exit( seggerFeeder( &_r ) );
+        if ( _r.options->nwserverPort )
+        {
+            exit( _nwserverFeeder( &_r ) );
+        }
+
+        if ( _r.options->port )
+        {
+            exit( _serialFeeder( &_r ) );
+        }
+
+        if ( _r.options->file )
+        {
+            exit( _fileFeeder( &_r ) );
+        }
     }
 
-    if ( _r.options->port )
-    {
-        exit( serialFeeder( &_r ) );
-    }
-
-    if ( _r.options->file )
-    {
-        exit( fileFeeder( &_r ) );
-    }
-
-    exit( usbFeeder( &_r ) );
+    /* ...nothing else left, it must be usb (either ORBTrace or BMP) */
+    exit( _usbFeeder( &_r ) );
 }
 // ====================================================================================================

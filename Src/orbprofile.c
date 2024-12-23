@@ -12,29 +12,32 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <signal.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
 #include <semaphore.h>
 #include <pthread.h>
 #include <assert.h>
+#include <getopt.h>
 
 #include "git_version_info.h"
 #include "uthash.h"
 #include "generics.h"
-#include "etmDecoder.h"
+#include "traceDecoder.h"
+#include "oflow.h"
 #include "symbols.h"
 #include "nw.h"
 #include "ext_fileformats.h"
+#include "stream.h"
 
 #define TICK_TIME_MS        (1)          /* Time intervals for checks */
 #define DEFAULT_DURATION_MS (1000)       /* Default time to sample, in mS */
 #define HANDLE_MASK         (0xFFFFFF)   /* cachegrind cannot cope with large file handle numbers */
 
+enum Prot { PROT_OFLOW, PROT_ETM, PROT_UNKNOWN };
+const char *protString[] = {"OFLOW", "ETM", NULL};
+
 /* How many transfer buffers from the source to allocate */
 #define NUM_RAW_BLOCKS (1000)
 
-#define DBG_OUT(...) printf(__VA_ARGS__)
+#define DBG_OUT(...) fprintf(stderr,__VA_ARGS__)
 //#define DBG_OUT(...)
 
 struct _subcallAccount
@@ -55,27 +58,32 @@ struct Options                           /* Record for options, either defaults 
     bool truncateDeleteMaterial;         /* Do we want this material totally removing from file references? */
 
     char *elffile;                       /* Target program config */
+    char *odoptions;                     /* Options to pass directly to objdump */
 
     char *dotfile;                       /* File to output dot information */
     char *profile;                       /* File to output profile information */
     int  sampleDuration;                 /* How long we are going to sample for */
-
+    bool mono;                           /* Supress colour in output */
     bool noaltAddr;                      /* Dont use alternate addressing */
-    bool useTPIU;                        /* Are we using TPIU, and stripping TPIU frames? */
-    int  channel;                        /* When TPIU is in use, which channel to decode? */
+    int  tag;                            /*  Which OFLOW stream are we decoding? */
+    enum TRACEprotocol tProtocol;        /* Encoding protocol to use */
 
     int  port;                           /* Source information for where to connect to */
     char *server;
+    enum Prot protocol;                  /* What protocol to communicate (default to OFLOW (== orbuculum)) */
+
 
 } _options =
 {
     .demangle       = true,
     .sampleDuration = DEFAULT_DURATION_MS,
-    .port           = NWCLIENT_SERVER_PORT,
+    .port           = OFCLIENT_SERVER_PORT,
+    .tProtocol      = TRACE_PROT_ETM35,
+    .tag            = 2,
     .server         = "localhost"
 };
 
-/* State of routine tracking, maintained across ETM callbacks to reconstruct program flow */
+/* State of routine tracking, maintained across TRACE callbacks to reconstruct program flow */
 struct opConstruct
 {
     struct execEntryHash *h;             /* The exec entry we were in last (file, function, line, addr etc) */
@@ -106,8 +114,9 @@ struct RunTime
     const char *progName;                       /* Name by which this program was called */
 
     /* Subsystem data support */
-    struct ETMDecoder i;
+    struct TRACEDecoder i;
     struct SymbolSet *s;                        /* Symbols read from elf */
+    struct OFLOW c;
 
     /* Calls related info */
     struct edge *calls;                         /* Call data table */
@@ -128,7 +137,8 @@ struct RunTime
 
     /* Subprocess control and interworking */
     pthread_t processThread;                    /* Thread handling received data flow */
-    sem_t     dataForClients;                   /* Semaphore counting data for clients */
+    pthread_cond_t dataForClients;              /* Semaphore counting data for clients */
+    pthread_mutex_t dataForClients_m;           /* Mutex for counting data for clients */
 
     /* Ring buffer for samples ... this 'pads' the rate data arrive and how fast they can be processed */
     int wp;                                     /* Read and write pointers into transfer buffers */
@@ -146,10 +156,7 @@ struct RunTime
 
     struct Options *options;                    /* Our runtime configuration */
 
-} _r =
-{
-    .options = &_options
-};
+} _r;
 
 // ====================================================================================================
 // ====================================================================================================
@@ -163,7 +170,7 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
 /* This is a call or a return, manipulate stack tracking appropriately */
 
 {
-    struct ETMCPUState *cpu = ETMCPUState( &r->i );
+    struct TRACECPUState *cpu = TRACECPUState( &r->i );
     struct subcall *s;
 
     /* ...add it to the call stack */
@@ -181,6 +188,7 @@ static void _callEvent( struct RunTime *r, uint32_t retAddr, uint32_t to )
     {
         /* This call entry doesn't exist (i.e. it's the first time this from/to pair have been seen...let's create it */
         s = ( struct subcall * )calloc( 1, sizeof( struct subcall ) );
+        MEMCHECKV( s );
         memcpy( &s->sig, &r->substack[r->substacklen].sig, sizeof( struct subcallSig ) );
         HASH_ADD( hh, r->subhead, sig, sizeof( struct subcallSig ), s );
     }
@@ -200,7 +208,7 @@ static void _returnEvent( struct RunTime *r, uint32_t to )
 /* This is a return, manipulate stack tracking appropriately */
 
 {
-    struct ETMCPUState *cpu = ETMCPUState( &r->i );
+    struct TRACECPUState *cpu = TRACECPUState( &r->i );
     struct subcall *s;
     uint32_t orig = r->substacklen;
 
@@ -266,6 +274,7 @@ static void _hashFindOrCreate( struct RunTime *r, uint32_t addr, struct execEntr
             }
 
             *h = calloc( 1, sizeof( struct execEntryHash ) );
+            MEMCHECKV( *h );
 
             ( *h )->addr          = r->op.workingAddr;
             ( *h )->fileindex     = n.fileindex;
@@ -332,7 +341,7 @@ static void _checkJumps( struct RunTime *r )
     if ( r->op.h )
     {
 
-        if ( ( ETMStateChanged( &r->i, EV_CH_EX_EXIT ) ) || ( r->op.h->isReturn ) )
+        if ( ( TRACEStateChanged( &r->i, EV_CH_EX_EXIT ) ) || ( r->op.h->isReturn ) )
         {
             _returnEvent( r, r->op.workingAddr );
         }
@@ -344,13 +353,13 @@ static void _checkJumps( struct RunTime *r )
     }
 }
 // ====================================================================================================
-static void _etmCB( void *d )
+static void _traceCB( void *d )
 
-/* Callback function for when valid ETM decode is detected */
+/* Callback function for when valid TRACE decode is detected */
 
 {
     struct RunTime *r       = ( struct RunTime * )d;
-    struct ETMCPUState *cpu = ETMCPUState( &r->i );
+    struct TRACECPUState *cpu = TRACECPUState( &r->i );
     static uint32_t incAddr        = 0;
     static uint32_t disposition    = 0;
 
@@ -363,15 +372,17 @@ static void _etmCB( void *d )
         /* Fill in a time to start from */
         r->starttime = genericsTimestampmS();
 
-        if ( ETMStateChanged( &r->i, EV_CH_ADDRESS ) )
+        if ( TRACEStateChanged( &r->i, EV_CH_ADDRESS ) )
         {
             r->op.workingAddr = cpu->addr;
-            printf( "Got initial address %08x" EOL, r->op.workingAddr );
+            DBG_OUT( "Got initial address %08x" EOL, r->op.workingAddr );
             r->sampling  = true;
         }
 
         /* Create false entry for an interrupt source */
         r->op.inth = calloc( 1, sizeof( struct execEntryHash ) );
+
+        MEMCHECKV( r->op.inth );
         r->op.inth->addr          = INTERRUPT;
         r->op.inth->fileindex     = INTERRUPT;
         r->op.inth->line          = NO_LINE;
@@ -384,26 +395,26 @@ static void _etmCB( void *d )
 
     /* Pull changes introduced by this event ============================== */
 
-    if ( ETMStateChanged( &r->i, EV_CH_ENATOMS ) )
+    if ( TRACEStateChanged( &r->i, EV_CH_ENATOMS ) )
     {
         /* We are going to execute some instructions. Check if the last of the old batch of    */
         /* instructions was cancelled and, if it wasn't and it's still outstanding, action it. */
-        if ( ETMStateChanged( &r->i, EV_CH_CANCELLED ) )
+        if ( TRACEStateChanged( &r->i, EV_CH_CANCELLED ) )
         {
-            printf( "CANCELLED" EOL );
+            DBG_OUT( "CANCELLED" EOL );
         }
         else
         {
             if ( incAddr )
             {
-                printf( "***" EOL );
+                DBG_OUT( "***" EOL );
                 _handleInstruction( r, disposition & 1 );
 
                 if ( ( r->op.h->isJump ) || ( r->op.h->isSubCall ) || ( r->op.h->isReturn ) )
                 {
-                    if ( ETMStateChanged( &r->i, EV_CH_ADDRESS ) )
+                    if ( TRACEStateChanged( &r->i, EV_CH_ADDRESS ) )
                     {
-                        printf( "New addr %08x" EOL, cpu->addr );
+                        DBG_OUT( "New addr %08x" EOL, cpu->addr );
                         r->op.workingAddr = cpu->addr;
                     }
 
@@ -412,16 +423,16 @@ static void _etmCB( void *d )
             }
         }
 
-        if ( ETMStateChanged( &r->i, EV_CH_ADDRESS ) )
+        if ( TRACEStateChanged( &r->i, EV_CH_ADDRESS ) )
         {
-            if ( ETMStateChanged( &r->i, EV_CH_EX_ENTRY ) )
+            if ( TRACEStateChanged( &r->i, EV_CH_EX_ENTRY ) )
             {
-                printf( "INTERRUPT!!" EOL );
+                DBG_OUT( "INTERRUPT!!" EOL );
                 _callEvent( r, r->op.workingAddr, cpu->addr );
             }
 
             r->op.workingAddr = cpu->addr;
-            printf( "A:%08x" EOL, cpu->addr );
+            DBG_OUT( "A:%08x" EOL, cpu->addr );
         }
 
         /* ================================================ */
@@ -429,7 +440,7 @@ static void _etmCB( void *d )
         /* ================================================ */
         incAddr     = cpu->eatoms + cpu->natoms;
         disposition = cpu->disposition;
-        printf( "E:%d N:%d" EOL, cpu->eatoms, cpu->natoms );
+        DBG_OUT( "E:%d N:%d" EOL, cpu->eatoms, cpu->natoms );
 
         /* Action those changes, except the last one */
         while ( incAddr > 1 )
@@ -443,46 +454,76 @@ static void _etmCB( void *d )
 }
 
 // ====================================================================================================
-static void _intHandler( int sig )
+static void _printHelp( const char *const progName )
 
-/* Catch CTRL-C so things can be cleaned up properly via atexit functions */
 {
-    /* CTRL-C exit is not an error... */
-    exit( 0 );
+    genericsPrintf( "Usage: %s [options]" EOL, progName );
+    genericsPrintf( "    -A, --alt-addr-enc: Switch off alternate address decoding (on by default)" EOL );
+    genericsPrintf( "    -D, --no-demangle:  Switch off C++ symbol demangling" EOL );
+    genericsPrintf( "    -d, --del-prefix:   <String> Material to delete off front of filenames" EOL );
+    genericsPrintf( "    -e, --elf-file:     <ElfFile> to use for symbols" EOL );
+    genericsPrintf( "    -E, --eof:          When reading from file, terminate at EOF" EOL );
+    genericsPrintf( "    -f, --input-file:   Take input from specified file" EOL );
+    genericsPrintf( "    -h, --help:         This help" EOL );
+    genericsPrintf( "    -I, --interval:     <Interval> Time between samples (in ms)" EOL );
+    genericsPrintf( "    -M, --no-colour:    Supress colour in output" EOL );
+    genericsPrintf( "    -O, --objdump-opts: <options> Options to pass directly to objdump" EOL );
+    genericsPrintf( "    -P, --trace-proto:  {ETM35|MTB} trace protocol to use, default is ETM35" EOL );
+    genericsPrintf( "    -p, --protocol:     Protocol to communicate. Defaults to OFLOW if -s is not set, otherwise raw ETM" EOL );
+    genericsPrintf( "    -s, --server:       <Server>:<Port> to use" EOL );
+    genericsPrintf( "    -t, --tag:          <stream>: Which OFLOW tag to use (normally 2)" EOL );
+    genericsPrintf( "    -T, --all-truncate: truncate -d material off all references (i.e. make output relative)" EOL );
+    genericsPrintf( "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsPrintf( "    -V, --version:      Print version and exit" EOL );
+    genericsPrintf( "    -y, --graph-file:   <Filename> dotty filename for structured callgraph output" EOL );
+    genericsPrintf( "    -z, --cache-file:   <Filename> profile filename for kcachegrind output" EOL );
+    genericsPrintf( EOL "(Will connect one port higher than that set in -s when Orbflow is not used)" EOL );
 }
 // ====================================================================================================
-static void _printHelp( struct RunTime *r )
+void _printVersion( void )
 
 {
-    genericsPrintf( "Usage: %s [options]" EOL, r->progName );
-    genericsPrintf( "       -a: Switch off alternate address decoding (on by default)" EOL );
-    genericsPrintf( "       -D: Switch off C++ symbol demangling" EOL );
-    genericsPrintf( "       -d: <String> Material to delete off front of filenames" EOL );
-    genericsPrintf( "       -E: When reading from file, terminate at end of file rather than waiting for further input" EOL );
-    genericsPrintf( "       -e: <ElfFile> to use for symbols" EOL );
-    genericsPrintf( "       -f <filename>: Take input from specified file" EOL );
-    genericsPrintf( "       -h: This help" EOL );
-    genericsPrintf( "       -I <Interval>: Time to sample (in mS)" EOL );
-    genericsPrintf( "       -s: <Server>:<Port> to use" EOL );
-    //genericsPrintf( "       -t <channel>: Use TPIU to strip TPIU on specfied channel (defaults to 2)" EOL );
-    genericsPrintf( "       -T: truncate -d material off all references (i.e. make output relative)" EOL );
-    genericsPrintf( "       -v: <level> Verbose mode 0(errors)..3(debug)" EOL );
-    genericsPrintf( "       -y: <Filename> dotty filename for structured callgraph output" EOL );
-    genericsPrintf( "       -z: <Filename> profile filename for kcachegrind output" EOL );
-    genericsPrintf( EOL "(Will connect one port higher than that set in -s when TPIU is not used)" EOL );
+    genericsPrintf( "orbprofile version " GIT_DESCRIBE );
 }
+// ====================================================================================================
+static struct option _longOptions[] =
+{
+    {"alt-addr-enc", no_argument, NULL, 'A'},
+    {"no-demangle", required_argument, NULL, 'D'},
+    {"del-prefix", required_argument, NULL, 'd'},
+    {"elf-file", required_argument, NULL, 'e'},
+    {"eof", no_argument, NULL, 'E'},
+    {"input-file", required_argument, NULL, 'f'},
+    {"help", no_argument, NULL, 'h'},
+    {"interval", required_argument, NULL, 'I'},
+    {"no-colour", no_argument, NULL, 'M'},
+    {"no-color", no_argument, NULL, 'M'},
+    {"objdump-opts", required_argument, NULL, 'O'},
+    {"trace-proto", required_argument, NULL, 'P'},
+    {"protocol", required_argument, NULL, 'p'},
+    {"server", required_argument, NULL, 's'},
+    {"all-truncate", no_argument, NULL, 'T'},
+    {"tag", required_argument, NULL, 't'},
+    {"verbose", required_argument, NULL, 'v'},
+    {"version", no_argument, NULL, 'V'},
+    {"graph-file", required_argument, NULL, 'y'},
+    {"cache-file", required_argument, NULL, 'z'},
+    {NULL, no_argument, NULL, 0}
+};
 // ====================================================================================================
 static bool _processOptions( int argc, char *argv[], struct RunTime *r )
 
 {
-    int c;
+    int c, optionIndex = 0;
+    bool protExplicit = false;
+    bool serverExplicit = false;
 
-    while ( ( c = getopt ( argc, argv, "aDd:Ee:f:hI:s:Tv:y:z:" ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "ADd:e:Ef:hVI:MO:P:p:s:t:Tv:y:z:", _longOptions, &optionIndex ) ) != -1 )
 
         switch ( c )
         {
             // ------------------------------------
-            case 'a':
+            case 'A':
                 r->options->noaltAddr = true;
                 break;
 
@@ -513,8 +554,19 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
 
             // ------------------------------------
             case 'h':
-                _printHelp( r );
+                _printHelp( r->progName );
                 exit( 0 );
+
+            // ------------------------------------
+
+            case 'M':
+                r->options->mono = true;
+                break;
+
+            // ------------------------------------
+            case 'V':
+                _printVersion();
+                return false;
 
             // ------------------------------------
             case 'I':
@@ -522,8 +574,50 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 break;
 
             // ------------------------------------
+
+            case 'O':
+                r->options->odoptions = optarg;
+                break;
+
+            // ------------------------------------
+
+            case 'P':
+
+                /* Index through protocol strings looking for match or end of list */
+                for ( r->options->tProtocol = TRACE_PROT_LIST_START;
+                        ( ( r->options->tProtocol != TRACE_PROT_LIST_END ) && strcasecmp( optarg, TRACEDecodeGetProtocolName( r->options->tProtocol ) ) );
+                        r->options->tProtocol++ )
+                {}
+
+                break;
+
+            // ------------------------------------
+
+            case 'p':
+                r->options->protocol = PROT_UNKNOWN;
+                protExplicit = true;
+
+                for ( int i = 0; protString[i]; i++ )
+                {
+                    if ( !strcmp( protString[i], optarg ) )
+                    {
+                        r->options->protocol = i;
+                        break;
+                    }
+                }
+
+                if ( r->options->protocol == PROT_UNKNOWN )
+                {
+                    genericsReport( V_ERROR, "Unrecognised protocol type" EOL );
+                    return false;
+                }
+
+                break;
+
+            // ------------------------------------
             case 's':
                 r->options->server = optarg;
+                serverExplicit = true;
 
                 // See if we have an optional port number too
                 char *a = optarg;
@@ -547,12 +641,23 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 break;
 
             // ------------------------------------
+            case 't':
+                r->options->tag = atoi( optarg );
+                break;
+
+            // ------------------------------------
             case 'T':
                 r->options->truncateDeleteMaterial = true;
                 break;
 
             // ------------------------------------
             case 'v':
+                if ( !isdigit( *optarg ) )
+                {
+                    genericsReport( V_ERROR, "-v requires a numeric argument." EOL );
+                    return false;
+                }
+
                 genericsSetReportLevel( atoi( optarg ) );
                 break;
 
@@ -586,6 +691,12 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 // ------------------------------------
         }
 
+    /* If we set an explicit server and port and didn't set a protocol chances are we want ETM, not OFLOW */
+    if ( serverExplicit && !protExplicit )
+    {
+        r->options->protocol = PROT_ETM;
+    }
+
     if ( !r->options->elffile )
     {
         genericsExit( -2, "Elf File not specified" EOL );
@@ -596,16 +707,39 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
         genericsExit( -2, "Illegal sample duration" EOL );
     }
 
-    genericsReport( V_INFO, "%s V" VERSION " (Git %08X %s, Built " BUILD_DATE ")" EOL, r->progName, GIT_HASH, ( GIT_DIRTY ? "Dirty" : "Clean" ) );
+    if ( r->options->tProtocol >= TRACE_PROT_NONE )
+    {
+        genericsExit( V_ERROR, "Unrecognised decode protocol" EOL );
+    }
+
+
+    genericsReport( V_INFO, "orbprofile version " GIT_DESCRIBE EOL );
     genericsReport( V_INFO, "Server          : %s:%d" EOL, r->options->server, r->options->port );
     genericsReport( V_INFO, "Delete Material : %s" EOL, r->options->deleteMaterial ? r->options->deleteMaterial : "None" );
     genericsReport( V_INFO, "Elf File        : %s (%s Names)" EOL, r->options->elffile, r->options->truncateDeleteMaterial ? "Truncate" : "Don't Truncate" );
+    genericsReport( V_INFO, "Objdump options : %s" EOL, r->options->odoptions ? r->options->odoptions : "None" );
+    genericsReport( V_INFO, "Protocol        : %s" EOL, TRACEDecodeGetProtocolName( r->options->tProtocol ) );
+    genericsReport( V_INFO, "Orbflow Tag     : %d" EOL, r->options->tag );
     genericsReport( V_INFO, "DOT file        : %s" EOL, r->options->dotfile ? r->options->dotfile : "None" );
     genericsReport( V_INFO, "Sample Duration : %d mS" EOL, r->options->sampleDuration );
 
+    switch ( r->options->protocol )
+    {
+        case PROT_OFLOW:
+            genericsReport( V_INFO, "Decoding OFLOW (Orbuculum) with ITM in stream %d" EOL, r->options->tag );
+            break;
+
+        case  PROT_ETM:
+            genericsReport( V_INFO, "Using raw ETM" EOL );
+            break;
+
+        default:
+            genericsReport( V_INFO, "Decoding unknown" EOL );
+            break;
+    }
+
     return true;
 }
-// ====================================================================================================
 // ====================================================================================================
 static void _doExit( void )
 
@@ -615,6 +749,33 @@ static void _doExit( void )
     _r.ending = true;
     /* Give them a bit of time, then we're leaving anyway */
     usleep( 200 );
+
+}
+// ====================================================================================================
+static void _intHandler( int sig )
+
+/* Catch CTRL-C so things can be cleaned up properly via atexit functions */
+{
+    /* CTRL-C exit is not an error... */
+    _doExit();
+}
+
+// ====================================================================================================
+
+static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
+
+{
+    if ( !p->good )
+    {
+        genericsReport( V_INFO, "Bad packet received" EOL );
+    }
+    else
+    {
+        if ( p->tag == _r.options->tag )
+        {
+            TRACEDecoderPump( &_r.i, p->d, p->len, _traceCB, &_r );
+        }
+    }
 }
 // ====================================================================================================
 static void *_processBlocks( void *params )
@@ -627,7 +788,7 @@ static void *_processBlocks( void *params )
 
     while ( true )
     {
-        sem_wait( &r->dataForClients );
+        pthread_cond_wait( &r->dataForClients, &r->dataForClients_m );
 
         if ( r->rp != ( volatile int )r->wp )
         {
@@ -643,21 +804,29 @@ static void *_processBlocks( void *params )
             uint8_t *c = r->rawBlock[r->rp].buffer;
             uint32_t y = r->rawBlock[r->rp].fillLevel;
 
-            fprintf( stderr, EOL );
+            DBG_OUT( EOL );
 
             while ( y-- )
             {
-                fprintf( stderr, "%02X ", *c++ );
+                DBG_OUT( "%02X ", *c++ );
 
                 if ( !( y % 16 ) )
                 {
-                    fprintf( stderr, EOL );
+                    DBG_OUT( EOL );
                 }
             }
 
 #endif
-            /* Pump all of the data through the protocol handler */
-            ETMDecoderPump( &r->i, r->rawBlock[r->rp].buffer, r->rawBlock[r->rp].fillLevel, _etmCB, genericsReport, &_r );
+
+            if ( PROT_OFLOW == r->options->protocol )
+            {
+                OFLOWPump( &_r.c, r->rawBlock[r->rp].buffer, r->rawBlock[r->rp].fillLevel, _OFLOWpacketRxed, &_r );
+            }
+            else
+            {
+                /* Pump all of the data through the protocol handler */
+                TRACEDecoderPump( &r->i, r->rawBlock[r->rp].buffer, r->rawBlock[r->rp].fillLevel, _traceCB, &_r );
+            }
 
             r->rp = ( r->rp + 1 ) % NUM_RAW_BLOCKS;
         }
@@ -669,23 +838,33 @@ static void *_processBlocks( void *params )
 int main( int argc, char *argv[] )
 
 {
-    int sourcefd;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
-    int flag = 1;
-
-    int r;
     struct timeval tv;
-    fd_set readfds;
+    struct Stream *stream = NULL;
+    enum symbolErr r;
+
+    DBG_OUT( "This utility is in development. Use at your own risk!!" EOL );
 
     /* Have a basic name and search string set up */
     _r.progName = genericsBasename( argv[0] );
+    _r.options = &_options;
+
+    if ( pthread_mutex_init( &_r.dataForClients_m, NULL ) != 0 )
+    {
+        genericsExit( -1, "Failed to establish mutex for condition variablee" EOL );
+    }
+
+    if ( pthread_cond_init( &_r.dataForClients, NULL ) != 0 )
+    {
+        genericsExit( -1, "Failed to establish condition variablee" EOL );
+    }
 
     if ( !_processOptions( argc, argv, &_r ) )
     {
         /* processOptions generates its own error messages */
         genericsExit( -1, "" EOL );
     }
+
+    genericsScreenHandling( !_r.options->mono );
 
     /* Make sure the fifos get removed at the end */
     atexit( _doExit );
@@ -696,80 +875,66 @@ int main( int argc, char *argv[] )
         genericsExit( -1, "Failed to establish Int handler" EOL );
     }
 
+#if !defined(WIN32)
+
     /* Don't kill a sub-process when any reader or writer evaporates */
     if ( SIG_ERR == signal( SIGPIPE, SIG_IGN ) )
     {
         genericsExit( -1, "Failed to ignore SIGPIPEs" EOL );
     }
 
-    ETMDecoderInit( &_r.i, !_r.options->noaltAddr );
+#endif
+
+    TRACEDecoderInit( &_r.i, _r.options->tProtocol, !_r.options->noaltAddr, genericsReport );
+    OFLOWInit( &_r.c );
 
     while ( !_r.ending )
     {
-        if ( !_r.options->file )
+        if ( _r.options->file != NULL )
         {
-            /* Get the socket open */
-            sourcefd = socket( AF_INET, SOCK_STREAM, 0 );
-            setsockopt( sourcefd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof( flag ) );
-
-            if ( sourcefd < 0 )
-            {
-                perror( "Error creating socket\n" );
-                return -EIO;
-            }
-
-            if ( setsockopt( sourcefd, SOL_SOCKET, SO_REUSEADDR, &( int )
-        {
-            1
-        }, sizeof( int ) ) < 0 )
-            {
-                perror( "setsockopt(SO_REUSEADDR) failed" );
-                return -EIO;
-            }
-
-            /* Now open the network connection */
-            bzero( ( char * ) &serv_addr, sizeof( serv_addr ) );
-            server = gethostbyname( _r.options->server );
-
-            if ( !server )
-            {
-                perror( "Cannot find host" );
-                return -EIO;
-            }
-
-            serv_addr.sin_family = AF_INET;
-            bcopy( ( char * )server->h_addr,
-                   ( char * )&serv_addr.sin_addr.s_addr,
-                   server->h_length );
-            serv_addr.sin_port = htons( _r.options->port + ( _r.options->useTPIU ? 0 : 1 ) );
-
-            if ( connect( sourcefd, ( struct sockaddr * ) &serv_addr, sizeof( serv_addr ) ) < 0 )
-            {
-                perror( "Could not connect" );
-                close( sourcefd );
-                usleep( 1000000 );
-                continue;
-            }
+            stream = streamCreateFile( _r.options->file );
         }
         else
         {
-            if ( ( sourcefd = open( _r.options->file, O_RDONLY ) ) < 0 )
+            while ( 1 )
             {
-                genericsExit( sourcefd, "Can't open file %s" EOL, _r.options->file );
+                stream = streamCreateSocket( _r.options->server, _r.options->port );
+
+                if ( !stream )
+                {
+                    break;
+                }
+
+                perror( "Could not connect" );
+                usleep( 1000000 );
             }
         }
+
 
         /* We need symbols constantly while running ... lets get them */
         if ( !SymbolSetValid( &_r.s, _r.options->elffile ) )
         {
-            if ( !( _r.s = SymbolSetCreate( _r.options->elffile, _r.options->deleteMaterial, _r.options->demangle, true, true ) ) )
+            r = SymbolSetCreate( &_r.s, _r.options->elffile, _r.options->deleteMaterial, _r.options->demangle, true, true, _r.options->odoptions );
+
+            switch ( r )
             {
-                genericsExit( -1, "Elf file or symbols in it not found" EOL );
+                case SYMBOL_NOELF:
+                    genericsExit( -1, "Elf file or symbols in it not found" EOL );
+                    break;
+
+                case SYMBOL_NOOBJDUMP:
+                    genericsExit( -1, "No objdump found" EOL );
+                    break;
+
+                case SYMBOL_UNSPECIFIED:
+                    genericsExit( -1, "Unknown error in symbol subsystem" EOL );
+                    break;
+
+                default:
+                    break;
             }
-            else
-            {
-                genericsReport( V_DEBUG, "Loaded %s" EOL, _r.options->elffile );
-            }
+
+            genericsReport( V_WARN, "Loaded %s" EOL, _r.options->elffile );
         }
 
         _r.intervalBytes = 0;
@@ -780,7 +945,6 @@ int main( int argc, char *argv[] )
         /* ----------------------------------------------------------------------------- */
         /* This is the main active loop...only break out of this when ending or on error */
         /* ----------------------------------------------------------------------------- */
-        FD_ZERO( &readfds );
 
         while ( !_r.ending )
         {
@@ -788,43 +952,34 @@ int main( int argc, char *argv[] )
             tv.tv_sec = 0;
             tv.tv_usec  = TICK_TIME_MS * 1000;
 
-            FD_SET( sourcefd, &readfds );
-            FD_SET( STDIN_FILENO, &readfds );
-            r = select( sourcefd + 1, &readfds, NULL, NULL, &tv );
-
-            if ( r < 0 )
-            {
-                /* Something went wrong in the select */
-                break;
-            }
 
             struct dataBlock *rxBlock = &_r.rawBlock[_r.wp];
 
-            if ( FD_ISSET( sourcefd, &readfds ) )
+            enum ReceiveResult result = stream->receive( stream, rxBlock->buffer, TRANSFER_SIZE, &tv, ( size_t * )&rxBlock->fillLevel );
+
+            if ( ( result == RECEIVE_RESULT_EOF ) || ( result == RECEIVE_RESULT_ERROR ) )
             {
-                /* We always read the data, even if we're held, to keep the socket alive */
-                rxBlock->fillLevel = read( sourcefd, rxBlock->buffer, TRANSFER_SIZE );
-
-                if ( rxBlock->fillLevel <= 0 )
-                {
-                    /* We are at EOF (Probably the descriptor closed) */
-                    break;
-                }
-
-                /* ...record the fact that we received some data */
-                _r.intervalBytes += rxBlock->fillLevel;
-
-
-                int nwp = ( _r.wp + 1 ) % NUM_RAW_BLOCKS;
-
-                if ( nwp == ( volatile int )_r.rp )
-                {
-                    genericsExit( -1, "Overflow" EOL );
-                }
-
-                _r.wp = nwp;
-                sem_post( &_r.dataForClients );
+                break;
             }
+
+            if ( rxBlock->fillLevel <= 0 )
+            {
+                /* We are at EOF (Probably the descriptor closed) */
+                break;
+            }
+
+            /* ...record the fact that we received some data */
+            _r.intervalBytes += rxBlock->fillLevel;
+
+            int nwp = ( _r.wp + 1 ) % NUM_RAW_BLOCKS;
+
+            if ( nwp == ( volatile int )_r.rp )
+            {
+                genericsExit( -1, "Overflow" EOL );
+            }
+
+            _r.wp = nwp;
+            pthread_cond_signal( &_r.dataForClients );
 
             /* Update the intervals */
             if ( ( ( volatile bool ) _r.sampling ) && ( ( genericsTimestampmS() - ( volatile uint32_t )_r.starttime ) > _r.options->sampleDuration ) )
@@ -841,11 +996,12 @@ int main( int argc, char *argv[] )
 
                 _r.rawBlock[_r.wp].fillLevel = 0;
                 _r.wp = nwp;
-                sem_post( &_r.dataForClients );
+                pthread_cond_signal( &_r.dataForClients );
             }
         }
 
-        close( sourcefd );
+        stream->close( stream );
+        free( stream );
     }
 
     /* Wait for data processing to be completed */

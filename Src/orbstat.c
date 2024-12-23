@@ -13,19 +13,18 @@
 #include <stdio.h>
 #include <signal.h>
 #include <assert.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
+#include <getopt.h>
 
 #include "git_version_info.h"
 #include "uthash.h"
 #include "generics.h"
 #include "itmDecoder.h"
-#include "tpiuDecoder.h"
 #include "msgDecoder.h"
+#include "oflow.h"
 #include "symbols.h"
 #include "nw.h"
 #include "ext_fileformats.h"
+#include "stream.h"
 
 #define TICK_TIME_MS        (1)          /* Time intervals for checks */
 #define DEFAULT_DURATION_MS (1000)       /* Default time to sample, in mS */
@@ -37,6 +36,9 @@
 #define COMMS_MASK (0xF0000000)
 #define IN_EVENT   (0x40000000)
 #define OUT_EVENT  (0x50000000)
+
+enum Prot { PROT_OFLOW, PROT_ITM, PROT_UNKNOWN };
+const char *protString[] = {"OFLOW", "ITM", NULL};
 
 /* States for sample reception state machine */
 enum CDState { CD_waitinout, CD_waitsrc, CD_waitdst };
@@ -52,6 +54,7 @@ struct Options                           /* Record for options, either defaults 
     bool truncateDeleteMaterial;         /* Do we want this material totally removing from file references? */
 
     char *elffile;                       /* Target program config */
+    char *odoptions;                     /* Options to pass directly to objdump */
 
     int traceChannel;                    /* ITM Channel used for trace */
     int fileChannel;                     /* ITM Channel used for file output */
@@ -60,21 +63,23 @@ struct Options                           /* Record for options, either defaults 
     char *profile;                       /* File to output profile information */
     uint32_t sampleDuration;             /* How long we are going to sample for */
     bool forceITMSync;                   /* Do we assume ITM starts synced? */
+    bool mono;                           /* Supress colour in output */
 
-    bool useTPIU;                        /* Are we using TPIU, and stripping TPIU frames? */
-    uint32_t tpiuITMChannel;             /* Which TPIU channel to use for ITM */
+    uint32_t tag;                        /* Which OFLOW stream are we decoding? */
 
     int port;                            /* Source information for where to connect to */
     char *server;
+    enum Prot protocol;                  /* What protocol to communicate (default to OFLOW (== orbuculum)) */
 
 } _options =
 {
     .demangle       = true,
     .sampleDuration = DEFAULT_DURATION_MS,
-    .port           = NWCLIENT_SERVER_PORT,
+    .port           = OFCLIENT_SERVER_PORT,
     .traceChannel   = DEFAULT_TRACE_CHANNEL,
     .fileChannel    = DEFAULT_FILE_CHANNEL,
     .forceITMSync   = true,
+    .tag            = 1,
     .server         = "localhost"
 };
 
@@ -90,8 +95,7 @@ struct RunTime
 {
     struct ITMDecoder i;                /* The decoders and the packets from them */
     struct ITMPacket h;
-    struct TPIUDecoder t;
-    struct TPIUPacket p;
+    struct OFLOW c;
     struct msg m;                       /* Decoded message out of ITM layer */
 
     const char *progName;               /* Name by which this program was called */
@@ -125,10 +129,7 @@ struct RunTime
     uint64_t highOrdert;                /* High order bits */
     uint64_t tcount;                    /* Constructed current count */
     uint64_t starttcount;               /* Count at which we started */
-} _r =
-{
-    .options = &_options
-};
+} _r;
 
 // ====================================================================================================
 // ====================================================================================================
@@ -211,6 +212,11 @@ static void _handleSW( struct RunTime *r )
                     {
                         r->from = calloc( 1, sizeof( struct execEntryHash ) );
 
+                        if ( !r->from )
+                        {
+                            genericsExit( ENOMEM,  "Memory allocation failure at %s::%d", __FILE__, __LINE__ );
+                        }
+
                         r->from->addr          = addr;
                         r->from->fileindex     = n.fileindex;
                         r->from->line          = n.line;
@@ -242,6 +248,11 @@ static void _handleSW( struct RunTime *r )
                     {
                         r->to = calloc( 1, sizeof( struct execEntryHash ) );
 
+                        if ( !r->to )
+                        {
+                            genericsExit( ENOMEM,  "Memory allocation failure at %s::%d", __FILE__, __LINE__ );
+                        }
+
                         r->to->addr          = addr;
                         r->to->fileindex     = n.fileindex;
                         r->to->line          = n.line;
@@ -255,11 +266,6 @@ static void _handleSW( struct RunTime *r )
                     }
 
                     HASH_ADD_INT( r->insthead, addr, ( r->to ) );
-                }
-
-                if ( r->from->addr > 0xfffffff0 )
-                {
-                    printf( "%s" EOL, SymbolFunction( r->s, r->to->functionindex ) );
                 }
 
                 r->to->count++;
@@ -280,6 +286,12 @@ static void _handleSW( struct RunTime *r )
                     {
                         /* This entry doesn't exist...let's create it */
                         s = ( struct subcall * )calloc( 1, sizeof( struct subcall ) );
+
+                        if ( !s )
+                        {
+                            genericsExit( ENOMEM,  "Memory allocation failure at %s::%d", __FILE__, __LINE__ );
+                        }
+
                         memcpy( &s->sig, &sig, sizeof( struct subcallSig ) );
                         s->srch = r->from;
                         s->dsth = r->to;
@@ -389,108 +401,71 @@ void _itmPumpProcess( struct RunTime *r, char c )
     }
 }
 // ====================================================================================================
-void _protocolPump( struct RunTime *r, uint8_t c )
-
-/* Top level protocol pump */
-
-{
-    if ( r->options->useTPIU )
-    {
-        switch ( TPIUPump( &r->t, c ) )
-        {
-            // ------------------------------------
-            case TPIU_EV_NEWSYNC:
-                genericsReport( V_INFO, "TPIU In Sync (%d)" EOL, TPIUDecoderGetStats( &r->t )->syncCount );
-
-            case TPIU_EV_SYNCED:
-                ITMDecoderForceSync( &r->i, true );
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_RXING:
-            case TPIU_EV_NONE:
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_UNSYNCED:
-                genericsReport( V_INFO, "TPIU Lost Sync (%d)" EOL, TPIUDecoderGetStats( &r->t )->lostSync );
-                ITMDecoderForceSync( &r->i, false );
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_RXEDPACKET:
-                if ( !TPIUGetPacket( &r->t, &r->p ) )
-                {
-                    genericsReport( V_WARN, "TPIUGetPacket fell over" EOL );
-                }
-
-                for ( uint32_t g = 0; g < r->p.len; g++ )
-                {
-                    if ( r->p.packet[g].s == r->options->tpiuITMChannel )
-                    {
-                        _itmPumpProcess( r, r->p.packet[g].d );
-                        continue;
-                    }
-
-                    if ( r->p.packet[g].s != 0 )
-                    {
-                        genericsReport( V_WARN, "Unknown TPIU channel %02x" EOL, r->p.packet[g].s );
-                    }
-                }
-
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_ERROR:
-                genericsReport( V_WARN, "****ERROR****" EOL );
-                break;
-                // ------------------------------------
-        }
-    }
-    else
-    {
-        /* There's no TPIU in use, so this goes straight to the ITM layer */
-        _itmPumpProcess( r, c );
-    }
-}
-// ====================================================================================================
-static void _intHandler( int sig )
-
-/* Catch CTRL-C so things can be cleaned up properly via atexit functions */
-{
-    /* CTRL-C exit is not an error... */
-    exit( 0 );
-}
-// ====================================================================================================
 static void _printHelp( struct RunTime *r )
 
 {
     genericsPrintf( "Usage: %s [options]" EOL, r->progName );
-    genericsPrintf( "       -D: Switch off C++ symbol demangling" EOL );
-    genericsPrintf( "       -d: <String> Material to delete off front of filenames" EOL );
-    genericsPrintf( "       -E: When reading from file, terminate at end of file rather than waiting for further input" EOL );
-    genericsPrintf( "       -e: <ElfFile> to use for symbols" EOL );
-    genericsPrintf( "       -f <filename>: Take input from specified file" EOL );
-    genericsPrintf( "       -g: <TraceChannel> for trace output (default %d)" EOL, r->options->traceChannel );
-    genericsPrintf( "       -h: This help" EOL );
-    genericsPrintf( "       -I <Interval>: Time to sample (in mS)" EOL );
-    genericsPrintf( "       -n: Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
-    genericsPrintf( "       -s: <Server>:<Port> to use" EOL );
-    genericsPrintf( "       -t <channel>: Use TPIU to strip TPIU on specfied channel (defaults to 1)" EOL );
-    genericsPrintf( "       -T: truncate -d material off all references (i.e. make output relative)" EOL );
-    genericsPrintf( "       -v: <level> Verbose mode 0(errors)..3(debug)" EOL );
-    genericsPrintf( "       -y: <Filename> dotty filename for structured callgraph output" EOL );
-    genericsPrintf( "       -z: <Filename> profile filename for kcachegrind output" EOL );
-    genericsPrintf( EOL "(Will connect one port higher than that set in -s when TPIU is not used)" EOL );
-
+    genericsPrintf( "    -D, --no-demangle:  Switch off C++ symbol demangling" EOL );
+    genericsPrintf( "    -d, --del-prefix:   <String> Material to delete off front of filenames" EOL );
+    genericsPrintf( "    -e, --elf-file:     <ElfFile> to use for symbols" EOL );
+    genericsPrintf( "    -E, --eof:          When reading from file, terminate at end of file" EOL );
+    genericsPrintf( "    -f, --input-file:   <filename>: Take input from specified file" EOL );
+    genericsPrintf( "    -g, --trace-chn:    <TraceChannel> ITM channel for trace (default %d)" EOL, r->options->traceChannel );
+    genericsPrintf( "    -h, --help:         This help" EOL );
+    genericsPrintf( "    -I, --interval:     <Interval>: Time to sample (in mS)" EOL );
+    genericsPrintf( "    -n, --itm-sync:     Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
+    genericsPrintf( "    -M, --no-colour:    Supress colour in output" EOL );
+    genericsPrintf( "    -O, --objdump-opts: <options> Options to pass directly to objdump" EOL );
+    genericsPrintf( "    -p, --protocol:     Protocol to communicate. Defaults to OFLOW if -s is not set, otherwise ITM" EOL );
+    genericsPrintf( "    -s, --server:       <Server>:<Port> to use" EOL );
+    genericsPrintf( "    -t, --tag:          <stream>: Which OFLOW tag to use (normally 1)" EOL );
+    genericsPrintf( "    -T, --all-truncate: truncate -d material off all references (i.e. make output relative)" EOL );
+    genericsPrintf( "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsPrintf( "    -V, --version:      Print version and exit" EOL );
+    genericsPrintf( "    -y, --graph-file:   <Filename> dotty filename for structured callgraph output" EOL );
+    genericsPrintf( "    -z, --cache-file:   <Filename> profile filename for kcachegrind output" EOL );
 }
+// ====================================================================================================
+void _printVersion( void )
+
+{
+    genericsPrintf( "orbstat version " GIT_DESCRIBE );
+}
+// ====================================================================================================
+static struct option _longOptions[] =
+{
+    {"no-demangle", no_argument, NULL, 'D'},
+    {"del-prefix", required_argument, NULL, 'd'},
+    {"elf-file", required_argument, NULL, 'e'},
+    {"eof", no_argument, NULL, 'E'},
+    {"input-file", required_argument, NULL, 'f'},
+    {"trace-chn", required_argument, NULL, 'g'},
+    {"help", no_argument, NULL, 'h'},
+    {"interval", required_argument, NULL, 'I'},
+    {"itm-sync", no_argument, NULL, 'n'},
+    {"no-colour", no_argument, NULL, 'M'},
+    {"no-color", no_argument, NULL, 'M'},
+    {"objdump-opts", required_argument, NULL, 'O'},
+    {"protocol", required_argument, NULL, 'p'},
+    {"server", required_argument, NULL, 's'},
+    {"tag", required_argument, NULL, 't'},
+    {"all-truncate", no_argument, NULL, 'T'},
+    {"verbose", required_argument, NULL, 'v'},
+    {"version", no_argument, NULL, 'V'},
+    {"graph-file", required_argument, NULL, 'y'},
+    {"cache-file", required_argument, NULL, 'z'},
+    {NULL, no_argument, NULL, 0}
+};
 // ====================================================================================================
 static bool _processOptions( int argc, char *argv[], struct RunTime *r )
 
 {
-    int c;
+    int c, optionIndex = 0;
+    bool protExplicit = false;
+    bool serverExplicit = false;
+    bool portExplicit = false;
 
-    while ( ( c = getopt ( argc, argv, "Dd:Ee:f:g:hI:n:s:Tt:v:y:z:" ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "Dd:e:Ef:g:hI:nO:p:s:t:Tv:Vy:z:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
@@ -529,8 +504,18 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 exit( 0 );
 
             // ------------------------------------
+            case 'V':
+                _printVersion();
+                return false;
+
+            // ------------------------------------
             case 'I':
                 r->options->sampleDuration = atoi( optarg );
+                break;
+
+            // ------------------------------------
+            case 'M':
+                r->options->mono = true;
                 break;
 
             // ------------------------------------
@@ -539,8 +524,38 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 break;
 
             // ------------------------------------
+
+            case 'O':
+                r->options->odoptions = optarg;
+                break;
+
+            // ------------------------------------
+
+            case 'p':
+                r->options->protocol = PROT_UNKNOWN;
+                protExplicit = true;
+
+                for ( int i = 0; protString[i]; i++ )
+                {
+                    if ( !strcmp( protString[i], optarg ) )
+                    {
+                        r->options->protocol = i;
+                        break;
+                    }
+                }
+
+                if ( r->options->protocol == PROT_UNKNOWN )
+                {
+                    genericsReport( V_ERROR, "Unrecognised protocol type" EOL );
+                    return false;
+                }
+
+                break;
+
+            // ------------------------------------
             case 's':
                 r->options->server = optarg;
+                serverExplicit = true;
 
                 // See if we have an optional port number too
                 char *a = optarg;
@@ -560,6 +575,10 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 {
                     r->options->port = NWCLIENT_SERVER_PORT;
                 }
+                else
+                {
+                    portExplicit = true;
+                }
 
                 break;
 
@@ -570,12 +589,17 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
 
             // ------------------------------------
             case 't':
-                r->options->tpiuITMChannel = atoi( optarg );
-                r->options->useTPIU = !r->options->useTPIU;
+                r->options->tag = atoi( optarg );
                 break;
 
             // ------------------------------------
             case 'v':
+                if ( !isdigit( *optarg ) )
+                {
+                    genericsReport( V_ERROR, "-v requires a numeric argument." EOL );
+                    return false;
+                }
+
                 genericsSetReportLevel( atoi( optarg ) );
                 break;
 
@@ -609,6 +633,17 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
                 // ------------------------------------
         }
 
+    /* If we set an explicit server and port and didn't set a protocol chances are we want ITM, not OFLOW */
+    if ( serverExplicit && !protExplicit )
+    {
+        r->options->protocol = PROT_ITM;
+    }
+
+    if ( ( r->options->protocol == PROT_ITM ) && !portExplicit )
+    {
+        r->options->port = NWCLIENT_SERVER_PORT;
+    }
+
     if ( !r->options->elffile )
     {
         genericsReport( V_ERROR, "Elf File not specified" EOL );
@@ -621,43 +656,76 @@ static bool _processOptions( int argc, char *argv[], struct RunTime *r )
         exit( -2 );
     }
 
-    genericsReport( V_INFO, "%s V" VERSION " (Git %08X %s, Built " BUILD_DATE ")" EOL, r->progName, GIT_HASH, ( GIT_DIRTY ? "Dirty" : "Clean" ) );
+    genericsReport( V_INFO, "orbstat version " GIT_DESCRIBE EOL );
     genericsReport( V_INFO, "Server          : %s:%d" EOL, r->options->server, r->options->port );
     genericsReport( V_INFO, "Delete Material : %s" EOL, r->options->deleteMaterial ? r->options->deleteMaterial : "None" );
     genericsReport( V_INFO, "Elf File        : %s %s" EOL, r->options->elffile, r->options->truncateDeleteMaterial ? "(Truncate)" : "(Don't Truncate)" );
     genericsReport( V_INFO, "DOT file        : %s" EOL, r->options->dotfile ? r->options->dotfile : "None" );
     genericsReport( V_INFO, "ForceSync       : %s" EOL, r->options->forceITMSync ? "true" : "false" );
-    genericsReport( V_INFO, "Trace Channel   : %d" EOL, r->options->traceChannel );
     genericsReport( V_INFO, "Sample Duration : %d mS" EOL, r->options->sampleDuration );
+    genericsReport( V_INFO, "Objdump options  : %s" EOL, r->options->odoptions ? r->options->odoptions : "None" );
+
+    switch ( r->options->protocol )
+    {
+        case PROT_OFLOW:
+            genericsReport( V_INFO, "Decoding OFLOW (Orbuculum) with ITM in stream %d" EOL, r->options->tag );
+            break;
+
+        case PROT_ITM:
+            genericsReport( V_INFO, "Decoding ITM" EOL );
+            break;
+
+        default:
+            genericsReport( V_INFO, "Decoding unknown" EOL );
+            break;
+    }
 
     return true;
 }
 // ====================================================================================================
-// ====================================================================================================
-static void _doExit( void )
+static void _intHandler( int sig )
 
-/* Perform any explicit exit functions */
+/* Catch CTRL-C so things can be cleaned up properly via atexit functions */
+{
+    /* CTRL-C exit is not an error... */
+    _r.ending = true;
+}
+// ====================================================================================================
+
+static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
 
 {
-    _r.ending = true;
-    /* Give them a bit of time, then we're leaving anyway */
-    usleep( 200 );
+    struct RunTime *r = ( struct RunTime * )param;
+
+    if ( !p->good )
+    {
+        genericsReport( V_INFO, "Bad packet received" EOL );
+    }
+    else
+    {
+        if ( p->tag == r->options->tag )
+        {
+            for ( int i = 0; i < p->len; i++ )
+            {
+                _itmPumpProcess( r, p->d[i] );
+            }
+        }
+    }
 }
+
 // ====================================================================================================
 int main( int argc, char *argv[] )
 
 {
-    int sourcefd;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
-    int flag = 1;
-
-    int r;
+    struct Stream *stream = NULL;
+    enum symbolErr r;
     struct timeval tv;
-    fd_set readfds;
 
     /* Have a basic name and search string set up */
     _r.progName = genericsBasename( argv[0] );
+
+    /* This is set here to avoid huge .data section in startup image */
+    _r.options = &_options;
 
     if ( !_processOptions( argc, argv, &_r ) )
     {
@@ -665,8 +733,7 @@ int main( int argc, char *argv[] )
         genericsExit( -1, "" EOL );
     }
 
-    /* Make sure the fifos get removed at the end */
-    atexit( _doExit );
+    genericsScreenHandling( !_r.options->mono );
 
     /* This ensures the atexit gets called */
     if ( SIG_ERR == signal( SIGINT, _intHandler ) )
@@ -674,86 +741,68 @@ int main( int argc, char *argv[] )
         genericsExit( -1, "Failed to establish Int handler" EOL );
     }
 
+#if !defined(WIN32)
+
     /* Don't kill a sub-process when any reader or writer evaporates */
     if ( SIG_ERR == signal( SIGPIPE, SIG_IGN ) )
     {
         genericsExit( -1, "Failed to ignore SIGPIPEs" EOL );
     }
 
-    /* Reset the TPIU handler before we start */
-    TPIUDecoderInit( &_r.t );
+#endif
+
+    /* Reset the handlers before we start */
     ITMDecoderInit( &_r.i, _r.options->forceITMSync );
+    OFLOWInit( &_r.c );
 
     while ( !_r.ending )
     {
-        if ( !_r.options->file )
+        if ( _r.options->file != NULL )
         {
-            /* Get the socket open */
-            sourcefd = socket( AF_INET, SOCK_STREAM, 0 );
-            setsockopt( sourcefd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof( flag ) );
-
-            if ( sourcefd < 0 )
-            {
-                perror( "Error creating socket\n" );
-                return -EIO;
-            }
-
-            if ( setsockopt( sourcefd, SOL_SOCKET, SO_REUSEADDR, &( int )
-        {
-            1
-        }, sizeof( int ) ) < 0 )
-            {
-                perror( "setsockopt(SO_REUSEADDR) failed" );
-                return -EIO;
-            }
-
-            /* Now open the network connection */
-            bzero( ( char * ) &serv_addr, sizeof( serv_addr ) );
-            server = gethostbyname( _r.options->server );
-
-            if ( !server )
-            {
-                perror( "Cannot find host" );
-                return -EIO;
-            }
-
-            serv_addr.sin_family = AF_INET;
-            bcopy( ( char * )server->h_addr,
-                   ( char * )&serv_addr.sin_addr.s_addr,
-                   server->h_length );
-            serv_addr.sin_port = htons( _r.options->port );
-
-            if ( connect( sourcefd, ( struct sockaddr * ) &serv_addr, sizeof( serv_addr ) ) < 0 )
-            {
-                perror( "Could not connect" );
-                close( sourcefd );
-                usleep( 1000000 );
-                continue;
-            }
+            stream = streamCreateFile( _r.options->file );
         }
         else
         {
-            if ( ( sourcefd = open( _r.options->file, O_RDONLY ) ) < 0 )
+            while ( 1 )
             {
-                genericsExit( sourcefd, "Can't open file %s" EOL, _r.options->file );
+                stream = streamCreateSocket( _r.options->server, _r.options->port );
+
+                if ( stream )
+                {
+                    break;
+                }
+
+                perror( "Could not connect" );
+                usleep( 1000000 );
             }
         }
 
         /* We need symbols constantly while running ... check they are current */
+        /* We need symbols constantly while running ... lets get them */
         if ( !SymbolSetValid( &_r.s, _r.options->elffile ) )
         {
-            if ( !( _r.s = SymbolSetCreate( _r.options->elffile, _r.options->deleteMaterial, _r.options->demangle, true, true ) ) )
+            r = SymbolSetCreate( &_r.s, _r.options->elffile, _r.options->deleteMaterial, _r.options->demangle, true, true, _r.options->odoptions );
+
+            switch ( r )
             {
-                genericsExit( -1, "Elf file or symbols in it not found" EOL );
+                case SYMBOL_NOELF:
+                    genericsExit( -1, "Elf file or symbols in it not found" EOL );
+                    break;
+
+                case SYMBOL_NOOBJDUMP:
+                    genericsExit( -1, "No objdump found" EOL );
+                    break;
+
+                case SYMBOL_UNSPECIFIED:
+                    genericsExit( -1, "Unknown error in symbol subsystem" EOL );
+                    break;
+
+                default:
+                    break;
             }
-            else
-            {
-                genericsReport( V_DEBUG, "Loaded %s" EOL, _r.options->elffile );
-            }
+
+            genericsReport( V_WARN, "Loaded %s" EOL, _r.options->elffile );
         }
-
-
-        FD_ZERO( &readfds );
 
         /* ----------------------------------------------------------------------------- */
         /* This is the main active loop...only break out of this when ending or on error */
@@ -764,36 +813,40 @@ int main( int argc, char *argv[] )
             tv.tv_sec = 0;
             tv.tv_usec  = TICK_TIME_MS * 1000;
 
-            FD_SET( sourcefd, &readfds );
-            FD_SET( STDIN_FILENO, &readfds );
-            r = select( sourcefd + 1, &readfds, NULL, NULL, &tv );
+            enum ReceiveResult result = stream->receive( stream, _r.rawBlock.buffer, TRANSFER_SIZE, &tv, ( size_t * )&_r.rawBlock.fillLevel );
 
-            if ( r < 0 )
+            if ( result != RECEIVE_RESULT_OK )
             {
-                /* Something went wrong in the select */
-                break;
-            }
-
-            if ( FD_ISSET( sourcefd, &readfds ) )
-            {
-                /* We always read the data, even if we're held, to keep the socket alive */
-                _r.rawBlock.fillLevel = read( sourcefd, _r.rawBlock.buffer, TRANSFER_SIZE );
-
-                if ( _r.rawBlock.fillLevel <= 0 )
+                if ( result == RECEIVE_RESULT_EOF && _r.options->fileTerminate )
                 {
-                    /* We are at EOF (Probably the descriptor closed) */
+                    _r.ending = true;
+                }
+                else if ( result == RECEIVE_RESULT_ERROR )
+                {
                     break;
                 }
+                else
+                {
+                    usleep( 100000 );
+                }
+            }
 
-                /* ...and record the fact that we received some data */
-                _r.intervalBytes += _r.rawBlock.fillLevel;
+            /* ...and record the fact that we received some data */
+            _r.intervalBytes += _r.rawBlock.fillLevel;
 
+            if ( PROT_OFLOW == _r.options->protocol )
+            {
+                OFLOWPump( &_r.c, _r.rawBlock.buffer, _r.rawBlock.fillLevel, _OFLOWpacketRxed, &_r );
+            }
+            else
+            {
                 /* Pump all of the data through the protocol handler */
                 uint8_t *c = _r.rawBlock.buffer;
 
-                while ( _r.rawBlock.fillLevel-- )
+                while ( _r.rawBlock.fillLevel > 0 )
                 {
-                    _protocolPump( &_r, *c++ );
+                    _itmPumpProcess( &_r, *c++ );
+                    _r.rawBlock.fillLevel--;
                 }
             }
 
@@ -810,7 +863,8 @@ int main( int argc, char *argv[] )
             }
         }
 
-        close( sourcefd );
+        stream->close( stream );
+        free( stream );
     }
 
     /* Data are collected, now process and report */

@@ -9,24 +9,24 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <sys/types.h>
+#include <sys/time.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <stdio.h>
 #include <assert.h>
 #include <inttypes.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
+#include <getopt.h>
 
 #include "cJSON.h"
 #include "generics.h"
 #include "uthash.h"
 #include "git_version_info.h"
-#include "generics.h"
-#include "tpiuDecoder.h"
 #include "itmDecoder.h"
+#include "oflow.h"
 #include "symbols.h"
 #include "msgSeq.h"
 #include "nw.h"
+#include "stream.h"
 
 #define CUTOFF              (10)             /* Default cutoff at 0.1% */
 #define TOP_UPDATE_INTERVAL (1000)           /* Interval between each on screen update */
@@ -51,6 +51,9 @@ struct reportLine
     struct nameEntry *n;
 };
 
+enum Prot { PROT_OFLOW, PROT_ITM, PROT_UNKNOWN };
+const char *protString[] = {"OFLOW", "ITM", NULL};
+
 struct exceptionRecord                       /* Record of exception activity */
 
 {
@@ -58,11 +61,13 @@ struct exceptionRecord                       /* Record of exception activity */
     int64_t totalTime;
     int64_t minTime;
     int64_t maxTime;
+    int64_t maxWallTime;
     uint32_t maxDepth;
 
     /* Elements used in calcuation */
     int64_t entryTime;
     int64_t thisTime;
+    int64_t stealTime;
     uint32_t prev;
 };
 
@@ -70,10 +75,9 @@ struct exceptionRecord                       /* Record of exception activity */
 /* ---------- CONFIGURATION ----------------- */
 struct                                       /* Record for options, either defaults or from command line */
 {
-    bool useTPIU;                            /* Are we decoding via the TPIU? */
+    uint32_t tag;                            /* Which OFLOW stream are we decoding? */
     bool reportFilenames;                    /* Report filenames for each routine? */
     bool outputExceptions;                   /* Set to include exceptions in output flow */
-    uint32_t tpiuITMChannel;                 /* What channel? */
     bool forceITMSync;                       /* Must ITM start synced? */
     char *file;                              /* File host connection */
 
@@ -82,11 +86,13 @@ struct                                       /* Record for options, either defau
     char *deleteMaterial;                    /* Material to delete off filenames for target */
 
     char *elffile;                           /* Target program config */
+    char *odoptions;                         /* Options to pass directly to objdump */
 
     char *json;                              /* Output in JSON format rather than human readable, either '-' for screen or filename */
     char *outfile;                           /* File to output current information */
     char *logfile;                           /* File to output historic information */
-
+    bool mono;                               /* Supress colour in output */
+    int paceDelay;                           /* Delay between blocks of data transmission in file readout */
     uint32_t cutscreen;                      /* Cut screen output after specified number of lines */
     uint32_t maxRoutines;                    /* Historic information to emit */
     bool lineDisaggregation;                 /* Aggregate per line or per function? */
@@ -95,19 +101,19 @@ struct                                       /* Record for options, either defau
 
     int port;                                /* Source information */
     char *server;
+    enum Prot protocol;                      /* What protocol to communicate (default to OFLOW (== orbuculum)) */
 
 } options =
 {
     .forceITMSync = true,
-    .useTPIU = false,
-    .tpiuITMChannel = 1,
+    .tag = 1,
     .outfile = NULL,
     .logfile = NULL,
     .lineDisaggregation = false,
     .maxRoutines = 8,
     .demangle = true,
-    .displayInterval = TOP_UPDATE_INTERVAL,
-    .port = NWCLIENT_SERVER_PORT,
+    .displayInterval = TOP_UPDATE_INTERVAL * 1000,
+    .port = OFCLIENT_SERVER_PORT,
     .server = "localhost"
 };
 
@@ -117,10 +123,10 @@ struct
     struct ITMDecoder i;                               /* The decoders and the packets from them */
     struct MSGSeq    d;                                   /* Message (re-)sequencer */
     struct ITMPacket h;
-    struct TPIUDecoder t;
-    struct TPIUPacket p;
+    struct OFLOW c;
     enum timeDelay timeStatus;                         /* Indicator of if this time is exact */
     uint64_t timeStamp;                                /* Latest received time */
+    struct Frame cobsPart;                             /* Any part frame that has been received */
 
     struct SymbolSet *s;                               /* Symbols read from elf */
     struct nameEntry *n;                               /* Current table of recognised names */
@@ -132,7 +138,7 @@ struct
     uint32_t erDepth;                                  /* Current depth of exception stack */
     char *depthList;                                   /* Record of maximum depth of exceptions */
 
-    int64_t lastReportmS;                              /* Last time an output report was generated, in milliseconds */
+    int64_t lastReportus;                              /* Last time an output report was generated, in microseconds */
     int64_t lastReportTicks;                           /* Last time an output report was generated, in ticks */
     uint32_t ITMoverflows;                             /* Has an ITM overflow been detected? */
     uint32_t SWPkt;                                    /* Number of SW Packets received */
@@ -143,6 +149,8 @@ struct
     uint32_t interrupts;
     uint32_t sleeps;
     uint32_t notFound;
+    bool ending;                                       /* Flag to exit */
+
 } _r;
 
 // ====================================================================================================
@@ -157,8 +165,8 @@ int64_t _timestamp( void )
 {
     struct timeval te;
     gettimeofday( &te, NULL ); // get current time
-    int64_t milliseconds = te.tv_sec * 1000LL + ( te.tv_usec + 500 ) / 1000; // caculate milliseconds
-    return milliseconds;
+    int64_t microseconds = te.tv_sec * 1000000LL + ( te.tv_usec ); // accumulate microseconds
+    return microseconds;
 }
 // ====================================================================================================
 int _addresses_sort_fn( void *a, void *b )
@@ -224,7 +232,10 @@ void _exitEx( int64_t ts )
     }
 
     /* Calculate total time for this exception as we're leaving it */
-    _r.er[_r.currentException].thisTime += ts - _r.er[_r.currentException].entryTime;
+    int64_t thisTime = ts - _r.er[_r.currentException].entryTime;
+    int64_t thisStealTime = _r.er[_r.currentException].stealTime;
+
+    _r.er[_r.currentException].thisTime += thisTime;
     _r.er[_r.currentException].visits++;
     _r.er[_r.currentException].totalTime += _r.er[_r.currentException].thisTime;
 
@@ -242,6 +253,13 @@ void _exitEx( int64_t ts )
         _r.er[_r.currentException].maxTime = _r.er[_r.currentException].thisTime;
     }
 
+    const int64_t walltime = _r.er[_r.currentException].thisTime + _r.er[_r.currentException].stealTime;
+
+    if ( walltime > _r.er[_r.currentException].maxWallTime )
+    {
+        _r.er[_r.currentException].maxWallTime = walltime;
+    }
+
     if ( _r.erDepth > _r.er[_r.currentException].maxDepth )
     {
         _r.er[_r.currentException].maxDepth = _r.erDepth;
@@ -249,12 +267,17 @@ void _exitEx( int64_t ts )
 
     /* Step out of this exception */
     _r.currentException = _r.er[_r.currentException].prev;
-    _r.erDepth--;
+
+    if ( _r.erDepth )
+    {
+        _r.erDepth--;
+    }
 
     /* If we are still in an exception then carry on accounting */
     if ( _r.currentException != NO_EXCEPTION )
     {
         _r.er[_r.currentException].entryTime = ts;
+        _r.er[_r.currentException].stealTime += thisTime + thisStealTime;
     }
 }
 // ====================================================================================================
@@ -298,16 +321,16 @@ void _handleException( struct excMsg *m, struct ITMDecoder *i )
             _r.currentException = m->exceptionNumber;
             _r.er[m->exceptionNumber].entryTime = _r.timeStamp;
             _r.er[m->exceptionNumber].thisTime = 0;
+            _r.er[m->exceptionNumber].stealTime = 0;
             _r.erDepth++;
             break;
 
         case EXEVENT_RESUME: /* Unwind all levels of exception (deals with tail chaining) */
-            while ( ( _r.currentException != NO_EXCEPTION ) && ( _r.erDepth ) )
+            while ( ( _r.currentException != m->exceptionNumber ) && ( _r.erDepth ) )
             {
                 _exitEx( _r.timeStamp );
             }
 
-            _r.currentException = NO_EXCEPTION;
             break;
 
         case EXEVENT_EXIT: /* Exit single level of exception */
@@ -316,7 +339,7 @@ void _handleException( struct excMsg *m, struct ITMDecoder *i )
 
         default:
         case EXEVENT_UNKNOWN:
-            genericsReport( V_ERROR, "Unrecognised exception event (%d,%d)" EOL, m->eventType, m->exceptionNumber );
+            genericsReport( V_INFO, "Unrecognised exception event (%d,%d)" EOL, m->eventType, m->exceptionNumber );
             break;
     };
 }
@@ -367,6 +390,12 @@ uint32_t _consolodateReport( struct reportLine **returnReport, uint32_t *returnR
             /* Make room for a report line */
             reportLines++;
             report = ( struct reportLine * )realloc( report, sizeof( struct reportLine ) * ( reportLines ) );
+
+            if ( !report )
+            {
+                genericsExit( -1, "Out of memory" EOL );
+            }
+
             report[reportLines - 1].n = a->n;
             report[reportLines - 1].count = 0;
         }
@@ -380,6 +409,11 @@ uint32_t _consolodateReport( struct reportLine **returnReport, uint32_t *returnR
     /* Now fold in any sleeping entries */
     report = ( struct reportLine * )realloc( report, sizeof( struct reportLine ) * ( reportLines + 1 ) );
 
+    if ( !report )
+    {
+        genericsExit( -1, "Out of memory" EOL );
+    }
+
     uint32_t addr = FN_SLEEPING;
     HASH_FIND_INT( _r.addresses, &addr, a );
 
@@ -389,13 +423,19 @@ uint32_t _consolodateReport( struct reportLine **returnReport, uint32_t *returnR
     }
     else
     {
-        n = ( struct nameEntry * )malloc( sizeof( struct nameEntry ) );
-    }
+        a = ( struct visitedAddr * )calloc( 1, sizeof( struct visitedAddr ) );
+        MEMCHECKV( a );
+        a->visits = _r.sleeps;
 
-    n->fileindex = NO_FILE;
-    n->functionindex = FN_SLEEPING;
-    n->addr = 0;
-    n->line = 0;
+        n = ( struct nameEntry * )malloc( sizeof( struct nameEntry ) );
+        n->fileindex = NO_FILE;
+        n->functionindex = FN_SLEEPING;
+        n->addr = FN_SLEEPING;
+        n->line = 0;
+
+        a->n = n;
+        HASH_ADD_INT( _r.addresses, n->addr, a );
+    }
 
     report[reportLines].n = n;
     report[reportLines].count = _r.sleeps;
@@ -435,7 +475,7 @@ static void _outputJson( FILE *f, uint32_t total, uint32_t reportLines, struct r
     jsonElement = cJSON_CreateNumber( total );
     assert( jsonElement );
     cJSON_AddItemToObject( jsonStore, "elements", jsonElement );
-    jsonElement = cJSON_CreateNumber( timeStamp - _r.lastReportmS );
+    jsonElement = cJSON_CreateNumber( timeStamp - _r.lastReportus );
     assert( jsonElement );
     cJSON_AddItemToObject( jsonStore, "interval", jsonElement );
 
@@ -451,9 +491,6 @@ static void _outputJson( FILE *f, uint32_t total, uint32_t reportLines, struct r
     jsonElement = cJSON_CreateNumber( ITMDecoderGetStats( &_r.i )->syncCount );
     assert( jsonElement );
     cJSON_AddItemToObject( jsonStatsTable, "itmsync", jsonElement );
-    jsonElement = cJSON_CreateNumber( TPIUDecoderGetStats( &_r.t )->syncCount );
-    assert( jsonElement );
-    cJSON_AddItemToObject( jsonStatsTable, "tpiusync", jsonElement );
     jsonElement = cJSON_CreateNumber( ITMDecoderGetStats( &_r.i )->ErrorPkt );
     assert( jsonElement );
     cJSON_AddItemToObject( jsonStatsTable, "error", jsonElement );
@@ -526,6 +563,9 @@ static void _outputJson( FILE *f, uint32_t total, uint32_t reportLines, struct r
             jsonElement = cJSON_CreateNumber( _r.er[e].maxTime );
             assert( jsonElement );
             cJSON_AddItemToObject( jsonTableEntry, "maxt", jsonElement );
+            jsonElement = cJSON_CreateNumber( _r.er[e].maxWallTime );
+            assert( jsonElement );
+            cJSON_AddItemToObject( jsonTableEntry, "maxwt", jsonElement );
         }
     }
 
@@ -537,6 +577,26 @@ static void _outputJson( FILE *f, uint32_t total, uint32_t reportLines, struct r
     fprintf( f, "%s" EOL, opString );
     free( opString );
 }
+
+static const char *ExceptionNames[] =
+{
+    [0] = "None",
+    [1] = "Reset",
+    [2] = "NMI",
+    [3] = "HardFault",
+    [4] = "MemManage",
+    [5] = "BusFault",
+    [6] = "UsageFault",
+    [7] = "Reserved",
+    [8] = "Reserved",
+    [9] = "Reserved",
+    [10] = "Reserved",
+    [11] = "SVCall",
+    [12] = "DebugMonitor",
+    [13] = "Reserved",
+    [14] = "PendSV",
+    [15] = "SysTick",
+};
 
 // ====================================================================================================
 static void _outputTop( uint32_t total, uint32_t reportLines, struct reportLine *report, int64_t lastTime )
@@ -565,7 +625,7 @@ static void _outputTop( uint32_t total, uint32_t reportLines, struct reportLine 
         q = fopen( options.logfile, "a" );
     }
 
-    fprintf( stdout, CLEAR_SCREEN );
+    genericsPrintf( CLEAR_SCREEN );
 
     if ( total )
     {
@@ -583,21 +643,21 @@ static void _outputTop( uint32_t total, uint32_t reportLines, struct reportLine 
                     dispSamples += report[n].count;
                     totPercent += percentage;
 
-                    fprintf( stdout, C_DATA "%3d.%02d%% " C_SUPPORT " %7" PRIu64 " ", percentage / 100, percentage % 100, report[n].count );
+                    genericsPrintf( C_DATA "%3d.%02d%% " C_SUPPORT " %7" PRIu64 " ", percentage / 100, percentage % 100, report[n].count );
 
 
                     if ( ( options.reportFilenames ) && ( report[n].n->fileindex != NO_FILE ) )
                     {
-                        fprintf( stdout, C_CONTEXT "%s" C_RESET "::", SymbolFilename( _r.s, report[n].n->fileindex ) );
+                        genericsPrintf( C_CONTEXT "%s" C_RESET "::", SymbolFilename( _r.s, report[n].n->fileindex ) );
                     }
 
                     if ( ( options.lineDisaggregation ) && ( report[n].n->line ) )
                     {
-                        fprintf( stdout, C_SUPPORT2 "%s" C_RESET "::" C_CONTEXT "%d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), report[n].n->line );
+                        genericsPrintf( C_SUPPORT2 "%s" C_RESET "::" C_CONTEXT "%d" EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ), report[n].n->line );
                     }
                     else
                     {
-                        fprintf( stdout, C_SUPPORT2 "%s" C_RESET EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ) );
+                        genericsPrintf( C_SUPPORT2 "%s" C_RESET EOL, d ? d : SymbolFunction( _r.s, report[n].n->functionindex ) );
                     }
 
                     printed++;
@@ -637,9 +697,9 @@ static void _outputTop( uint32_t total, uint32_t reportLines, struct reportLine 
         }
     }
 
-    fprintf( stdout, C_RESET "-----------------" EOL );
+    genericsPrintf( C_RESET "-----------------" EOL );
 
-    fprintf( stdout, C_DATA "%3d.%02d%% " C_SUPPORT " %7" PRIu64 " " C_RESET "of "C_DATA" %" PRIu64 " "C_RESET" Samples" EOL, totPercent / 100, totPercent % 100, dispSamples, samples );
+    genericsPrintf( C_DATA "%3d.%02d%% " C_SUPPORT " %7" PRIu64 " " C_RESET "of "C_DATA" %" PRIu64 " "C_RESET" Samples" EOL, totPercent / 100, totPercent % 100, dispSamples, samples );
 
     if ( p )
     {
@@ -658,42 +718,54 @@ static void _outputTop( uint32_t total, uint32_t reportLines, struct reportLine 
         /* Tidy up screen output */
         while ( printed++ <= options.cutscreen )
         {
-            fprintf( stdout, EOL );
+            genericsPrintf( EOL );
         }
 
-        fprintf( stdout, EOL " Ex |   Count  |  MaxD | TotalTicks  |  AveTicks  |  minTicks  |  maxTicks " EOL );
-        fprintf( stdout, "----+----------+-------+-------------+------------+------------+------------" EOL );
+        genericsPrintf( EOL " Exception         |   Count  |  MaxD | TotalTicks  |   %%   |  AveTicks  |  minTicks  |  maxTicks  |  maxWall " EOL );
+        genericsPrintf( /**/"-------------------+----------+-------+-------------+-------+------------+------------+------------+----------" EOL );
 
         for ( uint32_t e = 0; e < MAX_EXCEPTIONS; e++ )
         {
 
             if ( _r.er[e].visits )
             {
-                fprintf( stdout, C_DATA "%3" PRIu32 C_RESET " | " C_DATA "%8" PRIu64 C_RESET " |" C_DATA " %5"
-                         PRIu32 C_RESET " | "C_DATA " %9" PRIu64 C_RESET "  |  " C_DATA "%9" PRIu64 C_RESET " | " C_DATA "%9" PRIu64 C_RESET "  | " C_DATA" %9" PRIu64 C_RESET EOL,
-                         e, _r.er[e].visits, _r.er[e].maxDepth, _r.er[e].totalTime, _r.er[e].totalTime / _r.er[e].visits, _r.er[e].minTime, _r.er[e].maxTime );
+                char exceptionName[30] = { 0 };
+
+                if ( e < 16 )
+                {
+                    snprintf( exceptionName, sizeof( exceptionName ), "(%s)", ExceptionNames[e] );
+                }
+                else
+                {
+                    snprintf( exceptionName, sizeof( exceptionName ), "(IRQ %d)", e - 16 );
+                }
+
+                const float util_percent = ( float )_r.er[e].totalTime / ( _r.timeStamp - _r.lastReportTicks ) * 100.0f;
+                genericsPrintf( C_DATA "%3" PRId32 " %-14s" C_RESET " | " C_DATA "%8" PRIu64 C_RESET " |" C_DATA " %5"
+                                PRIu32 C_RESET " | "C_DATA " %9" PRIu64 C_RESET "  |" C_DATA "%6.1f" C_RESET " |  " C_DATA "%9" PRIu64 C_RESET " | " C_DATA "%9" PRIu64 C_RESET "  | " C_DATA" %9" PRIu64 C_RESET " | " C_DATA "%9"
+                                PRIu64 C_RESET EOL,
+                                e, exceptionName, _r.er[e].visits, _r.er[e].maxDepth, _r.er[e].totalTime, util_percent, _r.er[e].totalTime / _r.er[e].visits, _r.er[e].minTime, _r.er[e].maxTime, _r.er[e].maxWallTime );
             }
         }
     }
 
-    fprintf( stdout, EOL C_RESET "[%s%s%s%s" C_RESET "] ",
-             ( _r.ITMoverflows != ITMDecoderGetStats( &_r.i )->overflow ) ? C_OVF_IND "V" : C_RESET "-",
-             ( _r.SWPkt != ITMDecoderGetStats( &_r.i )->SWPkt ) ? C_SOFT_IND "S" : C_RESET "-",
-             ( _r.TSPkt != ITMDecoderGetStats( &_r.i )->TSPkt ) ? C_TSTAMP_IND "T" : C_RESET "-",
-             ( _r.HWPkt != ITMDecoderGetStats( &_r.i )->HWPkt ) ? C_HW_IND "H" : C_RESET "-" );
+    genericsPrintf( EOL C_RESET "[%s%s%s%s" C_RESET "] ",
+                    ( _r.ITMoverflows != ITMDecoderGetStats( &_r.i )->overflow ) ? C_OVF_IND "V" : C_RESET "-",
+                    ( _r.SWPkt != ITMDecoderGetStats( &_r.i )->SWPkt ) ? C_SOFT_IND "S" : C_RESET "-",
+                    ( _r.TSPkt != ITMDecoderGetStats( &_r.i )->TSPkt ) ? C_TSTAMP_IND "T" : C_RESET "-",
+                    ( _r.HWPkt != ITMDecoderGetStats( &_r.i )->HWPkt ) ? C_HW_IND "H" : C_RESET "-" );
 
-    if ( _r.lastReportTicks )
-        fprintf( stdout, "Interval = " C_DATA "%" PRIu64 "mS " C_RESET "/ "C_DATA "%" PRIu64 C_RESET " (~" C_DATA "%" PRIu64 C_RESET " Ticks/mS)" EOL,
-                 lastTime - _r.lastReportmS, _r.timeStamp - _r.lastReportTicks, ( _r.timeStamp - _r.lastReportTicks ) / ( lastTime - _r.lastReportmS ) );
+    if ( ( _r.lastReportTicks ) && ( lastTime != _r.lastReportus ) )
+        genericsPrintf( "Interval = " C_DATA "%" PRIu64 "ms " C_RESET "/ "C_DATA "%" PRIu64 C_RESET " (~" C_DATA "%" PRIu64 C_RESET " Ticks/ms)" EOL,
+                        ( ( lastTime - _r.lastReportus ) ) / 1000, _r.timeStamp - _r.lastReportTicks, ( ( _r.timeStamp - _r.lastReportTicks ) * 1000 ) / ( lastTime - _r.lastReportus ) );
     else
     {
-        fprintf( stdout, C_RESET "Interval = " C_DATA "%" PRIu64 C_RESET "mS" EOL, lastTime - _r.lastReportmS );
+        genericsPrintf( C_RESET "Interval = " C_DATA "%" PRIu64 C_RESET "ms" EOL, ( ( lastTime - _r.lastReportus ) ) / 1000 );
     }
 
-    genericsReport( V_INFO, "         Ovf=%3d  ITMSync=%3d TPIUSync=%3d ITMErrors=%3d" EOL,
+    genericsReport( V_INFO, "         Ovf=%3d  ITMSync=%3d ITMErrors=%3d" EOL,
                     ITMDecoderGetStats( &_r.i )->overflow,
                     ITMDecoderGetStats( &_r.i )->syncCount,
-                    TPIUDecoderGetStats( &_r.t )->syncCount,
                     ITMDecoderGetStats( &_r.i )->ErrorPkt );
 
 }
@@ -729,9 +801,11 @@ void _handlePCSample( struct pcSampleMsg *m, struct ITMDecoder *i )
             /* This is a new entry - record it */
 
             a = ( struct visitedAddr * )calloc( 1, sizeof( struct visitedAddr ) );
+            MEMCHECKV( a );
             a->visits = 1;
 
             a->n = ( struct nameEntry * )malloc( sizeof( struct nameEntry ) );
+            MEMCHECKV( a->n );
             memcpy( a->n, &n, sizeof( struct nameEntry ) );
             HASH_ADD_INT( _r.addresses, n->addr, a );
         }
@@ -741,16 +815,18 @@ void _handlePCSample( struct pcSampleMsg *m, struct ITMDecoder *i )
 void _flushHash( void )
 
 {
-    struct visitedAddr *a;
-    UT_hash_handle hh;
+    struct visitedAddr *a, *tmp;
 
-    for ( a = _r.addresses; a != NULL; a = hh.next )
+    HASH_ITER( hh, _r.addresses, a, tmp )
     {
-        hh = a->hh;
+        if ( a->n )
+        {
+            free( a->n );
+        }
+
+        HASH_DEL( _r.addresses, a );
         free( a );
     }
-
-    _r.addresses = NULL;
 }
 // ====================================================================================================
 // Pump characters into the itm decoder
@@ -786,7 +862,7 @@ void _itmPumpProcess( uint8_t c )
     }
 
     /* We are synced timewise, so empty anything that has been waiting */
-    while ( 1 )
+    while ( true )
     {
         p = MSGSeqGetPacket( &_r.d );
 
@@ -811,103 +887,80 @@ void _itmPumpProcess( uint8_t c )
 // Protocol pump for decoding messages
 // ====================================================================================================
 // ====================================================================================================
-void _protocolPump( uint8_t c )
-
-/* Top level protocol pump */
+void _printHelp( const char *const progName )
 
 {
-    if ( options.useTPIU )
-    {
-        switch ( TPIUPump( &_r.t, c ) )
-        {
-            // ------------------------------------
-            case TPIU_EV_NEWSYNC:
-                genericsReport( V_INFO, "TPIU In Sync (%d)" EOL, TPIUDecoderGetStats( &_r.t )->syncCount );
-
-            case TPIU_EV_SYNCED:
-                ITMDecoderForceSync( &_r.i, true );
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_RXING:
-            case TPIU_EV_NONE:
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_UNSYNCED:
-                genericsReport( V_WARN, "TPIU Lost Sync (%d)" EOL, TPIUDecoderGetStats( &_r.t )->lostSync );
-                ITMDecoderForceSync( &_r.i, false );
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_RXEDPACKET:
-                if ( !TPIUGetPacket( &_r.t, &_r.p ) )
-                {
-                    genericsReport( V_WARN, "TPIUGetPacket fell over" EOL );
-                }
-
-                for ( uint32_t g = 0; g < _r.p.len; g++ )
-                {
-                    if ( _r.p.packet[g].s == options.tpiuITMChannel )
-                    {
-                        _itmPumpProcess( _r.p.packet[g].d );
-                        continue;
-                    }
-
-                    if ( _r.p.packet[g].s != 0 )
-                    {
-                        genericsReport( V_WARN, "Unknown TPIU channel %02x" EOL, _r.p.packet[g].s );
-                    }
-                }
-
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_ERROR:
-                genericsReport( V_WARN, "****ERROR****" EOL );
-                break;
-                // ------------------------------------
-        }
-    }
-    else
-    {
-        /* There's no TPIU in use, so this goes straight to the ITM layer */
-        _itmPumpProcess( c );
-    }
+    genericsPrintf( "Usage: %s [options]" EOL, progName );
+    genericsPrintf( "    -c, --cut-after:    <num> Cut screen output after number of lines" EOL );
+    genericsPrintf( "    -D, --no-demangle:  Switch off C++ symbol demangling" EOL );
+    genericsPrintf( "    -d, --del-prefix:   <DeleteMaterial> to take off front of filenames" EOL );
+    genericsPrintf( "    -e, --elf-file:     <ElfFile> to use for symbols" EOL );
+    genericsPrintf( "    -E, --exceptions:   Include exceptions in output report" EOL );
+    genericsPrintf( "    -f, --input-file:   <filename> Take input from specified file" EOL );
+    genericsPrintf( "    -g, --record-file:  <LogFile> append historic records to specified file" EOL );
+    genericsPrintf( "    -h, --help:         This help" EOL );
+    genericsPrintf( "    -I, --interval:     <interval> Display interval in milliseconds (defaults to %dms)" EOL, TOP_UPDATE_INTERVAL );
+    genericsPrintf( "    -j, --json-file:    <filename> Output to file in JSON format (or screen if <filename> is '-')" EOL );
+    genericsPrintf( "    -l, --agg-lines:    Aggregate per line rather than per function" EOL );
+    genericsPrintf( "    -M, --no-colour:    Supress colour in output" EOL );
+    genericsPrintf( "    -n, --itm-sync:     Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
+    genericsPrintf( "    -o, --output-file:  <filename> to be used for output live file" EOL );
+    genericsPrintf( "    -O, --objdump-opts: <options> Options to pass directly to objdump" EOL );
+    genericsPrintf( "    -p, --protocol:     Protocol to communicate. Defaults to OFLOW if -s is not set, otherwise ITM" EOL );
+    genericsPrintf( "    -P, --pace:         <microseconds> delay in block of data transmission to clients" EOL );
+    genericsPrintf( "    -r, --routines:     <routines> to record in live file (default %d routines)" EOL, options.maxRoutines );
+    genericsPrintf( "    -R, --report-files: Report filenames as part of function discriminator" EOL );
+    genericsPrintf( "    -s, --server:       <Server>:<Port> to use" EOL );
+    genericsPrintf( "    -t, --tag:          <stream> Which OFLOW tag to use (normally 1)" EOL );
+    genericsPrintf( "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsPrintf( "    -V, --version:      Print version and exit" EOL );
+    genericsPrintf( EOL "Environment Variables;" EOL );
+    genericsPrintf( "  OBJDUMP: to use non-standard obbdump binary" EOL );
 }
 // ====================================================================================================
-void _printHelp( char *progName )
+void _printVersion( void )
 
 {
-    fprintf( stdout, "Usage: %s [options]" EOL, progName );
-    fprintf( stdout, "       -c: <num> Cut screen output after number of lines" EOL );
-    fprintf( stdout, "       -d: <DeleteMaterial> to take off front of filenames" EOL );
-    fprintf( stdout, "       -D: Switch off C++ symbol demangling" EOL );
-    fprintf( stdout, "       -e: <ElfFile> to use for symbols" EOL );
-    fprintf( stdout, "       -E: Include exceptions in output report" EOL );
-    fprintf( stdout, "       -f: <filename> Take input from specified file" EOL );
-    fprintf( stdout, "       -g: <LogFile> append historic records to specified file" EOL );
-    fprintf( stdout, "       -h: This help" EOL );
-    fprintf( stdout, "       -I: <interval> Display interval in milliseconds (defaults to %d mS)" EOL, TOP_UPDATE_INTERVAL );
-    fprintf( stdout, "       -j: <filename> Output to file in JSON format (or screen if <filename> is '-')" EOL );
-    fprintf( stdout, "       -l: Aggregate per line rather than per function" EOL );
-    fprintf( stdout, "       -n: Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
-    fprintf( stdout, "       -o: <filename> to be used for output live file" EOL );
-    fprintf( stdout, "       -r: <routines> to record in live file (default %d routines)" EOL, options.maxRoutines );
-    fprintf( stdout, "       -R: Report filenames as part of function discriminator" EOL );
-    fprintf( stdout, "       -s: <Server>:<Port> to use" EOL );
-    fprintf( stdout, "       -t: <channel> Use TPIU decoder on specified channel" EOL );
-    fprintf( stdout, "       -v: <level> Verbose mode 0(errors)..3(debug)" EOL );
-    fprintf( stdout, EOL "Environment Variables;" EOL );
-    fprintf( stdout, "  OBJDUMP: to use non-standard obbdump binary" EOL );
+    genericsPrintf( "orbtop version " GIT_DESCRIBE EOL );
 }
 // ====================================================================================================
-int _processOptions( int argc, char *argv[] )
+static struct option _longOptions[] =
+{
+    {"cut-after", required_argument, NULL, 'c'},
+    {"no-demangle", required_argument, NULL, 'D'},
+    {"del-prefix", required_argument, NULL, 'd'},
+    {"elf-file", required_argument, NULL, 'e'},
+    {"exceptions", no_argument, NULL, 'E'},
+    {"input-file", required_argument, NULL, 'f'},
+    {"record-file", required_argument, NULL, 'g'},
+    {"help", no_argument, NULL, 'h'},
+    {"interval", required_argument, NULL, 'I'},
+    {"json-file", required_argument, NULL, 'j'},
+    {"agg-lines", no_argument, NULL, 'l'},
+    {"itm-sync", no_argument, NULL, 'n'},
+    {"no-colour", no_argument, NULL, 'M'},
+    {"no-color", no_argument, NULL, 'M'},
+    {"output-file", required_argument, NULL, 'o'},
+    {"objdump-opts", required_argument, NULL, 'O'},
+    {"protocol", required_argument, NULL, 'p'},
+    {"pace", required_argument, NULL, 'P'},
+    {"routines", required_argument, NULL, 'r'},
+    {"report-files", no_argument, NULL, 'R'},
+    {"server", required_argument, NULL, 's'},
+    {"tag", required_argument, NULL, 't'},
+    {"verbose", required_argument, NULL, 'v'},
+    {"version", no_argument, NULL, 'V'},
+    {NULL, no_argument, NULL, 0}
+};
+// ====================================================================================================
+errcode _processOptions( int argc, char *argv[] )
 
 {
-    int c;
+    int c, optionIndex = 0;
+    bool protExplicit = false;
+    bool serverExplicit = false;
 
-    while ( ( c = getopt ( argc, argv, "c:d:DEe:f:g:hI:j:lm:no:r:Rs:t:v:" ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "c:d:DEe:f:g:hVI:j:lMnO:o:p:P:r:Rs:t:v:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
@@ -947,7 +1000,7 @@ int _processOptions( int argc, char *argv[] )
 
             // ------------------------------------
             case 'I':
-                options.displayInterval = ( int64_t ) ( atof( optarg ) );
+                options.displayInterval = ( int64_t ) ( atof( optarg ) ) * 1000;
                 break;
 
             // ------------------------------------
@@ -967,6 +1020,12 @@ int _processOptions( int argc, char *argv[] )
 
             // ------------------------------------
 
+            case 'M':
+                options.mono = true;
+                break;
+
+            // ------------------------------------
+
             case 'n':
                 options.forceITMSync = false;
                 break;
@@ -977,14 +1036,61 @@ int _processOptions( int argc, char *argv[] )
                 break;
 
             // ------------------------------------
+
+            case 'p':
+                options.protocol = PROT_UNKNOWN;
+                protExplicit = true;
+
+                for ( int i = 0; protString[i]; i++ )
+                {
+                    if ( !strcmp( protString[i], optarg ) )
+                    {
+                        options.protocol = i;
+                        break;
+                    }
+                }
+
+                if ( options.protocol == PROT_UNKNOWN )
+                {
+                    genericsReport( V_ERROR, "Unrecognised protocol type" EOL );
+                    return ERR;
+                }
+
+                break;
+
+            // ------------------------------------
+
+            case 'P':
+                options.paceDelay = atoi( optarg );
+
+                if ( options.paceDelay <= 0 )
+                {
+                    genericsReport( V_ERROR, "paceDelay is out of range" EOL );
+                    return ERR;
+                }
+
+                break;
+
+            // ------------------------------------
+
+            case 'O':
+                options.odoptions = optarg;
+                break;
+
+            // ------------------------------------
             case 'v':
+                if ( !isdigit( *optarg ) )
+                {
+                    genericsReport( V_ERROR, "-v requires a numeric argument." EOL );
+                    return ERR;		    
+                }
+
                 genericsSetReportLevel( atoi( optarg ) );
                 break;
 
             // ------------------------------------
             case 't':
-                options.useTPIU = true;
-                options.tpiuITMChannel = atoi( optarg );
+                options.tag = atoi( optarg );
                 break;
 
             // ------------------------------------
@@ -995,6 +1101,7 @@ int _processOptions( int argc, char *argv[] )
             // ------------------------------------
             case 's':
                 options.server = optarg;
+                serverExplicit = true;
 
                 // See if we have an optional port number too
                 char *a = optarg;
@@ -1023,6 +1130,11 @@ int _processOptions( int argc, char *argv[] )
                 return ERR;
 
             // ------------------------------------
+            case 'V':
+                _printVersion();
+                return ERR;
+
+            // ------------------------------------
             case '?':
                 if ( optopt == 'b' )
                 {
@@ -1033,31 +1145,33 @@ int _processOptions( int argc, char *argv[] )
                     genericsReport( V_ERROR, "Unknown option character `\\x%x'." EOL, optopt );
                 }
 
-                return -EINVAL;
+                return ERR;
 
             // ------------------------------------
             default:
                 genericsReport( V_ERROR, "Unknown option %c" EOL, optopt );
-                return -EINVAL;
+                return ERR;
                 // ------------------------------------
         }
 
-    if ( ( options.useTPIU ) && ( !options.tpiuITMChannel ) )
+    /* If we set an explicit server and port and didn't set a protocol chances are we want ITM, not OFLOW */
+    if ( serverExplicit && !protExplicit )
     {
-        genericsReport( V_ERROR, "TPIU set for use but no channel set for ITM output" EOL );
-        return -EINVAL;
+        genericsReport( V_ERROR, "Protocol must be explicit when server is explicit" EOL );
+        return ERR;
     }
 
     if ( !options.elffile )
     {
         genericsReport( V_ERROR, "Elf File not specified" EOL );
-        exit( -EBADF );
+        return ERR;
     }
 
-    genericsReport( V_INFO, "orbtop V" VERSION " (Git %08X %s, Built " BUILD_DATE ")" EOL, GIT_HASH, ( GIT_DIRTY ? "Dirty" : "Clean" ) );
+    genericsReport( V_INFO, "orbtop version " GIT_DESCRIBE EOL );
 
     if ( options.file )
     {
+        genericsReport( V_INFO, "Pace Delay       : %dus" EOL, options.paceDelay );
         genericsReport( V_INFO, "Input File       : %s", options.file );
     }
     else
@@ -1069,19 +1183,74 @@ int _processOptions( int argc, char *argv[] )
     genericsReport( V_INFO, "Elf File         : %s" EOL, options.elffile );
     genericsReport( V_INFO, "ForceSync        : %s" EOL, options.forceITMSync ? "true" : "false" );
     genericsReport( V_INFO, "C++ Demangle     : %s" EOL, options.demangle ? "true" : "false" );
-    genericsReport( V_INFO, "Display Interval : %d mS" EOL, options.displayInterval );
+    genericsReport( V_INFO, "Display Interval : %d ms" EOL, options.displayInterval / 1000 );
     genericsReport( V_INFO, "Log File         : %s" EOL, options.logfile ? options.logfile : "None" );
+    genericsReport( V_INFO, "Objdump options  : %s" EOL, options.odoptions ? options.odoptions : "None" );
 
-    if ( options.useTPIU )
+    switch ( options.protocol )
     {
-        genericsReport( V_INFO, "Using TPIU       : true (ITM on channel %d)" EOL, options.tpiuITMChannel );
+        case PROT_OFLOW:
+            genericsReport( V_INFO, "Decoding OFLOW (Orbuculum) with ITM in stream %d" EOL, options.tag );
+            break;
+
+        case PROT_ITM:
+            genericsReport( V_INFO, "Decoding ITM" EOL );
+            break;
+
+        default:
+            genericsReport( V_ERROR, "Decoding unknown" EOL );
+            return ERR;
     }
-    else
+
+    if ( ( options.paceDelay ) && ( !options.file ) )
     {
-        genericsReport( V_INFO, "Using TPIU       : false" EOL );
+        genericsReport( V_ERROR, "Pace Delay only makes sense when input is from a file" EOL );
+        return ERR;
     }
 
     return OK;
+}
+// ====================================================================================================
+
+static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
+
+{
+    if ( !p->good )
+    {
+        genericsReport( V_INFO, "Bad packet received" EOL );
+    }
+    else
+    {
+        if ( p->tag == options.tag )
+        {
+            for ( int i = 0; i < p->len; i++ )
+            {
+                _itmPumpProcess( p->d[i] );
+            }
+        }
+    }
+}
+
+// ====================================================================================================
+
+static struct Stream *_openStream( void )
+{
+    if ( options.file != NULL )
+    {
+        return streamCreateFile( options.file );
+    }
+    else
+    {
+        return streamCreateSocket( options.server, options.port );
+    }
+}
+
+// ====================================================================================================
+static void _intHandler( int sig )
+
+{
+    /* CTRL-C exit is not an error... */
+    _r.ending = true;
 }
 // ====================================================================================================
 // ====================================================================================================
@@ -1093,39 +1262,70 @@ int _processOptions( int argc, char *argv[] )
 int main( int argc, char *argv[] )
 
 {
-    int sourcefd;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
     uint8_t cbw[TRANSFER_SIZE];
-    int64_t lastTime;
 
     /* Output variables for interval report */
     uint32_t total;
     uint32_t reportLines = 0;
     struct reportLine *report;
+    bool alreadyReported = false;
 
-    ssize_t t;
-    int flag = 1;
-    int r;
     int64_t remainTime;
+    int64_t thisTime;
     struct timeval tv;
-    fd_set readfds;
-
-    /* Fill in a time to start from */
-    lastTime = _timestamp();
+    enum ReceiveResult receiveResult = RECEIVE_RESULT_OK;
+    size_t receivedSize = 0;
+    enum symbolErr r;
 
     if ( OK != _processOptions( argc, argv ) )
     {
         exit( -EINVAL );
     }
 
-    /* Reset the TPIU handler before we start */
-    TPIUDecoderInit( &_r.t );
+    genericsScreenHandling( !options.mono );
+
+    /* Check we've got _some_ symbols to start from */
+    r = SymbolSetCreate( &_r.s, options.elffile, options.deleteMaterial, options.demangle, true, true, options.odoptions );
+
+    switch ( r )
+    {
+        case SYMBOL_NOELF:
+            genericsExit( -1, "Elf file or symbols in it not found" EOL );
+            break;
+
+        case SYMBOL_NOOBJDUMP:
+            genericsExit( -1, "No objdump found" EOL );
+            break;
+
+        case SYMBOL_UNSPECIFIED:
+            genericsExit( -1, "Unknown error in symbol subsystem" EOL );
+            break;
+
+        default:
+            break;
+    }
+
+    genericsReport( V_WARN, "Loaded %s" EOL, options.elffile );
+
+    if ( _r.s )
+    {
+        genericsReport( V_INFO, "Files:      %d" EOL "Functions: %d" EOL "Source:    %d" EOL, _r.s->fileCount, _r.s->functionCount, _r.s->sourceCount );
+    }
+
+
+    /* Reset the handlers before we start */
     ITMDecoderInit( &_r.i, options.forceITMSync );
+    OFLOWInit( &_r.c );
     MSGSeqInit( &_r.d, &_r.i, MSG_REORDER_BUFLEN );
 
+    /* This ensures the signal handler gets called */
+    if ( SIG_ERR == signal( SIGINT, _intHandler ) )
+    {
+        genericsExit( -1, "Failed to establish Int handler" EOL );
+    }
+
     /* First interval will be from startup to first packet arriving */
-    _r.lastReportmS = _timestamp();
+    _r.lastReportus = _timestamp();
     _r.currentException = NO_EXCEPTION;
 
     /* Open file for JSON output if we have one */
@@ -1147,182 +1347,185 @@ int main( int argc, char *argv[] )
         }
     }
 
-    while ( 1 )
+    while ( !_r.ending )
     {
-        if ( !options.file )
+        struct Stream *stream = _openStream();
+
+        if ( stream == NULL )
         {
-            /* Get the socket open */
-            sourcefd = socket( AF_INET, SOCK_STREAM, 0 );
-            setsockopt( sourcefd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof( flag ) );
-
-            if ( sourcefd < 0 )
+            if ( !alreadyReported )
             {
-                perror( "Error creating socket\n" );
-                return -EIO;
+                genericsReport( V_ERROR, "No connection" EOL );
+                alreadyReported = true;
             }
 
-            if ( setsockopt( sourcefd, SOL_SOCKET, SO_REUSEADDR, &( int )
-        {
-            1
-        }, sizeof( int ) ) < 0 )
-            {
-                perror( "setsockopt(SO_REUSEADDR) failed" );
-                return -EIO;
-            }
-
-            /* Now open the network connection */
-            bzero( ( char * ) &serv_addr, sizeof( serv_addr ) );
-            server = gethostbyname( options.server );
-
-            if ( !server )
-            {
-                perror( "Cannot find host" );
-                return -EIO;
-            }
-
-            serv_addr.sin_family = AF_INET;
-            bcopy( ( char * )server->h_addr,
-                   ( char * )&serv_addr.sin_addr.s_addr,
-                   server->h_length );
-            serv_addr.sin_port = htons( options.port );
-
-            if ( connect( sourcefd, ( struct sockaddr * ) &serv_addr, sizeof( serv_addr ) ) < 0 )
-            {
-                if ( ( !options.json ) || ( options.json[0] != '-' ) )
-                {
-                    fprintf( stdout, CLEAR_SCREEN EOL );
-                }
-
-                perror( "Could not connect" );
-                close( sourcefd );
-                usleep( 1000000 );
-                continue;
-            }
+            usleep( 500 * 1000 );
+            continue;
         }
-        else
-        {
-            if ( ( sourcefd = open( options.file, O_RDONLY ) ) < 0 )
-            {
-                genericsExit( sourcefd, "Can't open file %s" EOL, options.file );
-            }
 
-        }
+        alreadyReported = false;
 
         if ( ( !options.json ) || ( options.json[0] != '-' ) )
         {
-            fprintf( stdout, CLEAR_SCREEN "Connected..." EOL );
+            genericsPrintf( CLEAR_SCREEN "Connected..." EOL );
         }
 
         /* ...just in case we have any readings from a previous incantation */
         _flushHash( );
 
-        lastTime = _timestamp();
+        thisTime = _r.lastReportus = _timestamp();
 
-        while ( 1 )
+        while ( !_r.ending )
         {
-            remainTime = ( ( lastTime + options.displayInterval - _timestamp() ) * 1000 ) - 500;
-            r = t = 0;
+            remainTime = ( ( _r.lastReportus + options.displayInterval - thisTime ) );
 
             if ( remainTime > 0 )
             {
                 tv.tv_sec = remainTime / 1000000;
                 tv.tv_usec  = remainTime % 1000000;
-
-                FD_ZERO( &readfds );
-                FD_SET( sourcefd, &readfds );
-                r = select( sourcefd + 1, &readfds, NULL, NULL, &tv );
+                receiveResult = stream->receive( stream, cbw, TRANSFER_SIZE, &tv, &receivedSize );
+            }
+            else
+            {
+                receiveResult = RECEIVE_RESULT_OK;
+                receivedSize = 0;
             }
 
-            if ( r < 0 )
+            thisTime = _timestamp();
+
+            if ( receiveResult == RECEIVE_RESULT_ERROR )
             {
-                /* Something went wrong in the select */
+                /* Something went wrong in the receive */
                 break;
             }
 
-            if ( r > 0 )
+            if ( receiveResult == RECEIVE_RESULT_EOF )
             {
-                t = read( sourcefd, cbw, TRANSFER_SIZE );
-
-                if ( t <= 0 )
-                {
-                    /* We are at EOF (Probably the descriptor closed) */
-                    break;
-                }
+                /* We are at EOF, hopefully next loop will get more data. */
             }
 
+            /* Check to make sure our symbols are still appropriate */
             if ( !SymbolSetValid( &_r.s, options.elffile ) )
             {
                 /* Make sure old references are invalidated */
                 _flushHash();
 
-                if ( !( _r.s = SymbolSetCreate( options.elffile, options.deleteMaterial, options.demangle, false, false ) ) )
+                r = SymbolSetCreate( &_r.s, options.elffile, options.deleteMaterial, options.demangle, true, true, options.odoptions );
+
+                switch ( r )
                 {
-                    genericsReport( V_ERROR, "Could not read symbols" EOL );
-                    usleep( 1000000 );
-                    break;
+                    case SYMBOL_NOELF:
+                        genericsReport( V_WARN, "Elf file or symbols in it not found" EOL );
+                        break;
+
+                    case SYMBOL_NOOBJDUMP:
+                        genericsExit( -1, "No objdump found" EOL );
+                        break;
+
+                    case SYMBOL_UNSPECIFIED:
+                        genericsExit( -1, "Unknown error in symbol subsystem" EOL );
+                        break;
+
+                    default:
+                        break;
+                }
+
+                if ( SYMBOL_NOELF == r )
+                {
+                    usleep( 1000000L );
+                    continue;
+                }
+
+                genericsReport( V_WARN, "Loaded %s" EOL, options.elffile );
+
+                if ( _r.s )
+                {
+                    genericsReport( V_INFO, "Files:      %d" EOL "Functions: %d" EOL "Source:    %d" EOL, _r.s->fileCount, _r.s->functionCount, _r.s->sourceCount );
+                }
+            }
+
+
+
+            if ( receivedSize )
+            {
+                if ( PROT_OFLOW == options.protocol )
+                {
+                    OFLOWPump( &_r.c, cbw, receivedSize, _OFLOWpacketRxed, &_r );
                 }
                 else
                 {
-                    genericsReport( V_WARN, "Loaded %s" EOL, options.elffile );
+                    /* Pump all of the data through the protocol handler */
+                    uint8_t *c = cbw;
+
+                    while ( receivedSize > 0 )
+                    {
+                        _itmPumpProcess( *c++ );
+                        receivedSize--;
+                    }
                 }
             }
 
-            /* Pump all of the data through the protocol handler */
-            uint8_t *c = cbw;
-
-            while ( t-- )
-            {
-                _protocolPump( *c++ );
-            }
-
             /* See if its time to post-process it */
-            if ( r <= 0 )
+            if ( receiveResult == RECEIVE_RESULT_TIMEOUT || remainTime <= 0 )
             {
                 /* Create the report that we will output */
                 total = _consolodateReport( &report, &reportLines );
 
-                lastTime = _timestamp();
-
                 if ( options.json )
                 {
-                    _outputJson( _r.jsonfile, total, reportLines, report, lastTime );
+                    _outputJson( _r.jsonfile, total, reportLines, report, thisTime );
                 }
 
                 if ( ( !options.json ) || ( options.json[0] != '-' ) )
                 {
-                    _outputTop( total, reportLines, report, lastTime );
+                    _outputTop( total, reportLines, report, thisTime );
                 }
 
                 /* ... and we are done with the report now, get rid of it */
                 free( report );
+                /* and, the hash of seen addresses! */
+                _flushHash();
 
                 /* ...and zero the exception records */
                 for ( uint32_t e = 0; e < MAX_EXCEPTIONS; e++ )
                 {
-                    _r.er[e].visits = _r.er[e].maxDepth = _r.er[e].totalTime = _r.er[e].minTime = _r.er[e].maxTime = 0;
+                    _r.er[e].visits = _r.er[e].maxDepth = _r.er[e].totalTime = _r.er[e].minTime = _r.er[e].maxTime = _r.er[e].maxWallTime = 0;
                 }
 
                 /* It's safe to update these here because the ticks won't be updated until more
                  * records arrive. */
+                if ( _r.ITMoverflows != ITMDecoderGetStats( &_r.i )->overflow )
+                {
+                    /* We had an overflow, so can't safely track max depth ... reset it */
+                    _r.erDepth = 0;
+                }
+
                 _r.ITMoverflows = ITMDecoderGetStats( &_r.i )->overflow;
                 _r.SWPkt = ITMDecoderGetStats( &_r.i )->SWPkt;
                 _r.TSPkt = ITMDecoderGetStats( &_r.i )->TSPkt;
                 _r.HWPkt = ITMDecoderGetStats( &_r.i )->HWPkt;
-                _r.lastReportmS = lastTime;
+                _r.lastReportus =  thisTime;
                 _r.lastReportTicks = _r.timeStamp;
 
                 /* Check to make sure there's not an unexpected TPIU in here */
                 if ( ITMDecoderGetStats( &_r.i )->tpiuSyncCount )
                 {
                     genericsReport( V_WARN, "Got a TPIU sync while decoding ITM...did you miss a -t option?" EOL );
+                    ITMDecoderGetStats( &_r.i )->tpiuSyncCount = 0;
                 }
+            }
+
+            if ( options.paceDelay )
+            {
+                usleep( options.paceDelay );
             }
         }
 
-        close( sourcefd );
+        stream->close( stream );
+        free( stream );
     }
 
-    if ( ( !ITMDecoderGetStats( &_r.i )->tpiuSyncCount ) )
+    if ( !_r.ending && ( !ITMDecoderGetStats( &_r.i )->tpiuSyncCount ) )
     {
         genericsReport( V_ERROR, "Read failed" EOL );
     }

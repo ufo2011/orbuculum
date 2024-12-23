@@ -11,10 +11,14 @@
 #include <ctype.h>
 #include "generics.h"
 #include "symbols.h"
+#if defined(WIN32)
+    #include <Windows.h>
+    #include <io.h>
+    #include <fcntl.h>
+#endif
 
 #define MAX_LINE_LEN (4096)
 #define ELF_RELOAD_DELAY_TIME 1000000   /* Time before elf reload will be attempted when its been lost */
-#define ELF_CHECK_DELAY_TIME  100000    /* Time that elf file has to be stable before it's considered complete */
 
 #define OBJDUMP "arm-none-eabi-objdump"
 #define OBJENVNAME "OBJDUMP"
@@ -26,14 +30,14 @@
 #define NO_FILE_TXT      "No Source"
 
 //#define GPTI_DEBUG 1                 /* Define this for objdump data collection state machine trace */
-
+//#define _DUMP_SYMBOLS                /* Define this to dump all symbols at start of run */
 #ifdef GPTI_DEBUG
     #define GTPIP(...) { fprintf(stderr, __VA_ARGS__); }
 #else
     #define GTPIP(...) {}
 #endif
 
-enum LineType { LT_NOISE, LT_PROC_LABEL, LT_LABEL, LT_SOURCE, LT_ASSEMBLY, LT_FILEANDLINE, LT_NEWLINE, LT_ERROR };
+enum LineType { LT_NULL, LT_NOISE, LT_PROC_LABEL, LT_LABEL, LT_SOURCE, LT_ASSEMBLY, LT_FILEANDLINE, LT_NEWLINE, LT_ERROR };
 enum ProcessingState {PS_IDLE, PS_GET_SOURCE, PS_GET_ASSY} ps = PS_IDLE;
 
 // ====================================================================================================
@@ -110,6 +114,11 @@ static uint32_t _getFunctionEntryIdx( struct SymbolSet *s, char *function )
     return ( i < s->functionCount ) ? i : SYM_NOT_FOUND;
 }
 // ====================================================================================================
+// Strdup leak is deliberately ignored. That is the central purpose of this code!
+#pragma GCC diagnostic push
+#if !defined(__clang__)
+    #pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
+#endif
 static uint32_t _getOrAddFunctionEntryIdx( struct SymbolSet *s, char *function )
 
 /* Return index to file entry in the functions table, or create an entry and return that */
@@ -124,11 +133,13 @@ static uint32_t _getOrAddFunctionEntryIdx( struct SymbolSet *s, char *function )
         f = s->functionCount;
         memset( &( s->functions[f] ), 0, sizeof( struct functionEntry ) );
         s->functions[f].name = strdup( function );
+        MEMCHECK( s->functions[f].name, 0 );
         s->functionCount++;
     }
 
     return f;
 }
+#pragma GCC diagnostic pop
 // ====================================================================================================
 static struct sourceLineEntry *_AddSourceLineEntry( struct SymbolSet *s )
 
@@ -225,6 +236,12 @@ static enum LineType _getLineType( char *sourceLine, char *p1, char *p2, char *p
 /* Analyse line returned by objdump and categorise it. If objdump output is misinterpreted, this is the first place to check */
 
 {
+    /* If it's empty, something is badly wrong */
+    if ( !*sourceLine )
+    {
+        return LT_NULL;
+    }
+
     /* If it starts with a source tag, it's unambigious */
     if ( !strncmp( sourceLine, SOURCE_INDICATOR, strlen( SOURCE_INDICATOR ) ) )
     {
@@ -244,6 +261,11 @@ static enum LineType _getLineType( char *sourceLine, char *p1, char *p2, char *p
     /* If it has something with <xxx> in it, it's a proc label (function) */
     if ( 2 == sscanf( sourceLine, "%[0-9a-fA-F] <%[^>]>", p1, p2 ) )
     {
+        /* Demangled C++ names may have multiple ">" characters. Expand until last one. */
+        const char *const beg = strchr( sourceLine, '<' ) + 1;
+        const char *const end = strrchr( beg, '>' );
+        ( void )memcpy( p2, beg, end - beg );
+        p2[end - beg] = '\0';
         return LT_PROC_LABEL;
     }
 
@@ -275,6 +297,12 @@ static enum LineType _getLineType( char *sourceLine, char *p1, char *p2, char *p
         return LT_FILEANDLINE;
     }
 
+    /* Alternative form for Windows; If it contains Drive:text:num then it's a file and line */
+    if ( 3 == sscanf( sourceLine, "%2c%[^:]:%[0-9]", p1, &p1[2], p2 ) )
+    {
+        return LT_FILEANDLINE;
+    }
+
     /* If it contains nothing other than newline then its a newline */
     if ( ( *sourceLine == '\n' ) || ( *sourceLine == '\r' ) )
     {
@@ -301,8 +329,117 @@ static bool _getDest( char *assy, uint32_t *dest )
     /* Check for cbz destination format (i.e. with a register in front of the destination address) */
     return ( 1 == sscanf( assy, "%*[^\t]\tr%*[0-7],%x", dest ) );
 }
+
+#if defined(WIN32)
+static FILE *_openProcess( char *commandLine, PROCESS_INFORMATION *processInfo, FILE **errorOutput )
+{
+    HANDLE readingPipe;
+    HANDLE processOutPipe;
+
+    HANDLE errorReadingPipe;
+    HANDLE processErrorPipe;
+
+    {
+        // Create pipe for process' stdout
+        SECURITY_ATTRIBUTES pipeSecurity;
+        pipeSecurity.nLength = sizeof( pipeSecurity );
+        pipeSecurity.bInheritHandle = true;
+        pipeSecurity.lpSecurityDescriptor = NULL;
+        CreatePipe( &readingPipe, &processOutPipe, &pipeSecurity, 0 );
+
+        // only write side of pipe should be inherited
+        SetHandleInformation( readingPipe, HANDLE_FLAG_INHERIT, 0 );
+    }
+
+    {
+        // Create pipe for process' stderr
+        SECURITY_ATTRIBUTES pipeSecurity;
+        pipeSecurity.nLength = sizeof( pipeSecurity );
+        pipeSecurity.bInheritHandle = true;
+        pipeSecurity.lpSecurityDescriptor = NULL;
+        CreatePipe( &errorReadingPipe, &processErrorPipe, &pipeSecurity, 1 * 1024 * 1024 );
+
+        // only write side of pipe should be inherited
+        SetHandleInformation( errorReadingPipe, HANDLE_FLAG_INHERIT, 0 );
+    }
+
+    memset( processInfo, 0, sizeof( PROCESS_INFORMATION ) );
+
+    {
+        STARTUPINFOA startupInfo;
+        memset( &startupInfo, 0, sizeof( startupInfo ) );
+        startupInfo.cb = sizeof( startupInfo );
+        startupInfo.hStdOutput = processOutPipe;
+        startupInfo.hStdInput = GetStdHandle( STD_INPUT_HANDLE );
+        startupInfo.hStdError = processErrorPipe;
+        startupInfo.dwFlags = STARTF_USESTDHANDLES;
+
+        BOOL success = CreateProcessA(
+                                   NULL,
+                                   commandLine,
+                                   NULL,
+                                   NULL,
+                                   true,
+                                   DETACHED_PROCESS,
+                                   NULL,
+                                   NULL,
+                                   &startupInfo,
+                                   processInfo
+                       );
+
+        // Close handle passed to child process
+        CloseHandle( processOutPipe );
+        CloseHandle( processErrorPipe );
+
+        if ( !success )
+        {
+            CloseHandle( readingPipe );
+            CloseHandle( errorReadingPipe );
+            return NULL;
+        }
+    }
+
+    int fd = _open_osfhandle( ( intptr_t )readingPipe, _O_RDONLY );
+
+    if ( fd == -1 )
+    {
+        CloseHandle( readingPipe );
+        CloseHandle( errorReadingPipe );
+        return NULL;
+    }
+
+    FILE *f = _fdopen( fd, "r" );
+
+    if ( f == NULL )
+    {
+        _close( fd );
+        return NULL;
+    }
+
+    int errorFd = _open_osfhandle( ( intptr_t )errorReadingPipe, _O_RDONLY );
+
+    if ( errorFd == -1 )
+    {
+        fclose( f );
+        CloseHandle( errorReadingPipe );
+        return NULL;
+    }
+
+    *errorOutput = _fdopen( errorFd, "r" );
+
+    if ( *errorOutput == NULL )
+    {
+        _close( errorFd );
+        fclose( f );
+        return NULL;
+    }
+
+    return f;
+}
+#endif
+
 // ====================================================================================================
-static bool _getTargetProgramInfo( struct SymbolSet *s )
+static enum symbolErr _getTargetProgramInfo( struct SymbolSet *s )
 
 /* Analyse line returned by objdump and categorise it, putting results into correct structures. */
 /* If objdump output is misinterpreted, this is the second place to check */
@@ -330,23 +467,29 @@ static bool _getTargetProgramInfo( struct SymbolSet *s )
 
     if ( stat( s->elfFile, &s->st ) != 0 )
     {
-        return false;
+        return SYMBOL_NOELF;
     }
 
     if ( getenv( OBJENVNAME ) )
     {
-        snprintf( commandLine, MAX_LINE_LEN, "%s -Sl%s --source-comment=" SOURCE_INDICATOR " %s", getenv( OBJENVNAME ),  s->demanglecpp ? " -C" : "", s->elfFile );
+        snprintf( commandLine, MAX_LINE_LEN, "%s -Sl%s --source-comment=" SOURCE_INDICATOR " %s %s", getenv( OBJENVNAME ),  s->demanglecpp ? " -C" : "", s->elfFile, s->odoptions );
     }
     else
     {
-        snprintf( commandLine, MAX_LINE_LEN, OBJDUMP " -Sl%s --source-comment=" SOURCE_INDICATOR " %s",  s->demanglecpp ? " -C" : "", s->elfFile );
+        snprintf( commandLine, MAX_LINE_LEN, OBJDUMP " -Sl%s --source-comment=" SOURCE_INDICATOR " %s %s",  s->demanglecpp ? " -C" : "", s->elfFile, s->odoptions );
     }
 
+#if defined(WIN32)
+    PROCESS_INFORMATION processInfo;
+    FILE *errorOut;
+    f = _openProcess( commandLine, &processInfo, &errorOut );
+#else
     f = popen( commandLine, "r" );
+#endif
 
     if ( !f )
     {
-        return false;
+        return SYMBOL_NOOBJDUMP;
     }
 
 
@@ -363,7 +506,7 @@ static bool _getTargetProgramInfo( struct SymbolSet *s )
         if ( lt == LT_ERROR )
         {
             pclose( f );
-            return false;
+            return SYMBOL_UNSPECIFIED;
         }
 
         GTPIP( "**************** %s", line );
@@ -556,10 +699,10 @@ static bool _getTargetProgramInfo( struct SymbolSet *s )
                                 sourceEntry->assy[sourceEntry->assyLines].codes |= ( strtoul( p2, NULL, 16 ) << 16 );
                             }
 
-                            sourceEntry->assy[sourceEntry->assyLines].lineText  = strdup( line );
-                            sourceEntry->assy[sourceEntry->assyLines].isJump    = false;
-                            sourceEntry->assy[sourceEntry->assyLines].isReturn  = false;
-                            sourceEntry->assy[sourceEntry->assyLines].isSubCall = false;
+                            sourceEntry->assy[sourceEntry->assyLines].lineText           = strdup( line );
+                            sourceEntry->assy[sourceEntry->assyLines].isJump             = false;
+                            sourceEntry->assy[sourceEntry->assyLines].isReturn           = false;
+                            sourceEntry->assy[sourceEntry->assyLines].isSubCall          = false;
                             sourceEntry->assy[sourceEntry->assyLines].jumpdest  = NO_DESTADDRESS;
 
                             /* Just hook the assy pointer to the location in the line where the assembly itself starts */
@@ -572,6 +715,28 @@ static bool _getTargetProgramInfo( struct SymbolSet *s )
                                    sourceEntry->assy[sourceEntry->assyLines].lineText );
 
 #define MASKED_COMPARE(mask,compare) (((sourceEntry->assy[sourceEntry->assyLines].codes)&(mask))==(compare))
+
+                            /* For ETM4 we need to know direct and indirect branches, cos they are the only instructions                */
+                            /* that will get traced. So let's label those...Per definition in ARM IHI0064H.a ID20820 Appendix F         */
+                            if (
+                                        MASKED_COMPARE( 0xffffff03, 0x00004700 ) || /* BL, BLX rx */
+                                        MASKED_COMPARE( 0xfffff500, 0x0000b100 ) || /* CBNZ/CBZ   */
+                                        MASKED_COMPARE( 0xfffff000, 0x0000d000 ) || /* B          */
+                                        MASKED_COMPARE( 0xffffffef, 0x0000bf20 ) || /* WFE/WFI    */
+
+                                        /* 32 bit matches */
+                                        MASKED_COMPARE( 0xffd08000, 0xe8908000 ) || /* LDM */
+                                        MASKED_COMPARE( 0xffd08000, 0xe9908000 ) || /* LDMDB */
+                                        MASKED_COMPARE( 0xfe10f000, 0xf810f000 ) || /* LDR to PC */
+                                        MASKED_COMPARE( 0xf8008000, 0xf0008000 )  /* Branches and misc control */
+                            )
+                            {
+                                sourceEntry->assy[sourceEntry->assyLines].etm4branch = true;
+                            }
+                            else
+                            {
+                                sourceEntry->assy[sourceEntry->assyLines].etm4branch = false;
+                            }
 
                             /* The only way a subroutine will be called from gcc (See gcc source code file gcc/config/arm/thumb2.md) is */
                             /* via blx reg, blxns reg. In theory it could also be done via direct manipulation of R15, but fortunately  */
@@ -653,14 +818,63 @@ static bool _getTargetProgramInfo( struct SymbolSet *s )
         }
     }
 
-    if ( 0 != pclose( f ) )
+#if defined(WIN32)
+    WaitForSingleObject( processInfo.hProcess, INFINITE );
+
+    DWORD exitCode = 1;
+
+    if ( !GetExitCodeProcess( processInfo.hProcess, &exitCode ) )
     {
-        /* Something went wrong in the close process */
-        return false;
+        exitCode = 1;
     }
 
+    CloseHandle( processInfo.hThread );
+    CloseHandle( processInfo.hProcess );
+
+    if ( exitCode != 0 )
+    {
+        while ( !feof( errorOut ) )
+        {
+            fgets( line, MAX_LINE_LEN, errorOut );
+            fputs( line, stderr );
+        }
+
+        return SYMBOL_NOOBJDUMP;
+    }
+
+    fclose( errorOut );
+#else
+
+    if ( 0 != pclose( f ) )
+    {
+        /* Something went wrong in the subprocess */
+        return SYMBOL_NOOBJDUMP;
+    }
+
+#endif
+
     _sortLines( s );
-    return true;
+
+#ifdef _DUMP_SYMBOLS
+    uint32_t sline = 0;
+    uint32_t functionindex = s->sources[0].functionIdx;
+    uint32_t firstaddr = s->sources[0].startAddr;
+
+    while ( sline < s->sourceCount - 1 )
+    {
+        if ( s->sources[sline + 1].functionIdx != functionindex )
+        {
+            printf( "%08x-%08x %s" EOL, firstaddr, s->sources[sline].endAddr, s->functions[functionindex].name );
+            functionindex = s->sources[sline + 1].functionIdx;
+            firstaddr = s->sources[sline + 1].startAddr;
+        }
+
+        sline++;
+    }
+
+#endif
+
+    return SYMBOL_OK;
 }
 // ====================================================================================================
 const char *SymbolFilename( struct SymbolSet *s, uint32_t index )
@@ -735,7 +949,6 @@ bool SymbolLookup( struct SymbolSet *s, uint32_t addr, struct nameEntry *n )
         n->linesInBlock = linesInBlock;
         return true;
     }
-
 
     n->fileindex = n->functionindex = n->line = 0;
     n->source   = "";
@@ -819,6 +1032,11 @@ void SymbolSetDelete( struct SymbolSet **s )
             free( ( *s )->deleteMaterial );
         }
 
+        if ( ( *s )->odoptions )
+        {
+            free( ( *s )->odoptions );
+        }
+
         free( *s );
         *s = NULL;
     }
@@ -845,6 +1063,9 @@ bool SymbolSetValid( struct SymbolSet **s, char *filename )
 #ifdef OSX
             ( memcmp( &n.st_mtimespec, &( ( *s )->st.st_mtimespec ), sizeof( struct timespec ) ) ) ||
             ( memcmp( &n.st_ctimespec, &( ( *s )->st.st_ctimespec ), sizeof( struct timespec ) ) )
+#elif WIN32
+            ( memcmp( &n.st_mtime, &( ( *s )->st.st_mtime ), sizeof( n.st_mtime ) ) ) ||
+            ( memcmp( &n.st_ctime, &( ( *s )->st.st_ctime ), sizeof( n.st_ctime ) ) )
 #else
             ( memcmp( &n.st_mtim, &( ( *s )->st.st_mtim ), sizeof( struct timespec ) ) ) ||
             ( memcmp( &n.st_ctim, &( ( *s )->st.st_ctim ), sizeof( struct timespec ) ) )
@@ -860,62 +1081,89 @@ bool SymbolSetValid( struct SymbolSet **s, char *filename )
     }
 }
 // ====================================================================================================
-struct SymbolSet *SymbolSetCreate( const char *filename, const char *deleteMaterial, bool demanglecpp, bool recordSource, bool recordAssy )
+// Malloc leak is deliberately ignored. That is the central purpose of this code!
+#pragma GCC diagnostic push
+#if !defined(__clang__)
+    #pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
+#endif
+enum symbolErr SymbolSetCreate( struct SymbolSet **ss, const char *filename, const char *deleteMaterial,
+                                bool demanglecpp, bool recordSource, bool recordAssy, const char *objdumpOptions )
 
 /* Create new symbol set by reading from elf file, if it's there and stable */
 
 {
     struct stat statbuf, newstatbuf;
-    struct SymbolSet *s = ( struct SymbolSet * )calloc( sizeof( struct SymbolSet ), 1 );
+    struct SymbolSet *s;
+    enum symbolErr  ret = SYMBOL_UNSPECIFIED;
+
+    s = ( struct SymbolSet * )calloc( sizeof( struct SymbolSet ), 1 );
+    MEMCHECK( s, 0 );
+
+    s->odoptions        = strdup( objdumpOptions ? objdumpOptions : "" );
+    MEMCHECK( s->odoptions, 0 );
     s->elfFile          = strdup( filename );
+    MEMCHECK( s->elfFile, 0 );
     s->deleteMaterial   = strdup( deleteMaterial ? deleteMaterial : "" );
+    MEMCHECK( s->deleteMaterial, 0 );
     s->recordSource     = recordSource;
     s->demanglecpp      = demanglecpp;
     s->recordAssy       = recordAssy;
 
+
     /* Make sure this file is stable before trying to load it */
-    if ( stat( filename, &statbuf ) == 0 )
+    if ( ( stat( filename, &statbuf ) != 0 ) || !( statbuf.st_mode & S_IFREG ) )
+    {
+        ret = SYMBOL_NOELF;
+    }
+    else
     {
         /* There is at least a file here */
+
         while ( 1 )
         {
-            usleep( ELF_CHECK_DELAY_TIME );
+            usleep( ELF_RELOAD_DELAY_TIME );
 
-            if ( stat( filename, &newstatbuf ) != 0 )
+            if ( stat( filename, &newstatbuf ) == 0 )
             {
-                break;
-            }
-
-            /* We check filesize, modification time and status change time for any differences */
-            if (
-                        ( memcmp( &statbuf.st_size, &newstatbuf.st_size, sizeof( off_t ) ) ) ||
+                /* We check filesize, modification time and status change time for any differences */
+                if (
+                            ( !newstatbuf.st_size ) ||
+                            ( memcmp( &statbuf.st_size, &newstatbuf.st_size, sizeof( off_t ) ) ) ||
 #ifdef OSX
-                        ( memcmp( &statbuf.st_mtimespec, &newstatbuf.st_mtimespec, sizeof( struct timespec ) ) ) ||
-                        ( memcmp( &statbuf.st_ctimespec, &newstatbuf.st_ctimespec, sizeof( struct timespec ) ) )
+                            ( memcmp( &statbuf.st_mtimespec, &newstatbuf.st_mtimespec, sizeof( struct timespec ) ) ) ||
+                            ( memcmp( &statbuf.st_ctimespec, &newstatbuf.st_ctimespec, sizeof( struct timespec ) ) )
+#elif WIN32
+                            ( memcmp( &statbuf.st_mtime, &newstatbuf.st_mtime, sizeof( statbuf.st_mtime ) ) ) ||
+                            ( memcmp( &statbuf.st_ctime, &newstatbuf.st_ctime, sizeof( statbuf.st_ctime ) ) )
 #else
-                        ( memcmp( &statbuf.st_mtim, &newstatbuf.st_mtim, sizeof( struct timespec ) ) ) ||
-                        ( memcmp( &statbuf.st_ctim, &newstatbuf.st_ctim, sizeof( struct timespec ) ) )
+                            ( memcmp( &statbuf.st_mtim, &newstatbuf.st_mtim, sizeof( struct timespec ) ) ) ||
+                            ( memcmp( &statbuf.st_ctim, &newstatbuf.st_ctim, sizeof( struct timespec ) ) )
 #endif
-            )
-            {
-                /* Make this the version we check next time around */
-                memcpy( &statbuf, &newstatbuf, sizeof( struct stat ) );
-                continue;
-            }
-
-            if ( _getTargetProgramInfo( s ) )
-            {
-                return s;
-            }
-            else
-            {
-                break;
+                )
+                {
+                    /* Make this the version we check next time around */
+                    memcpy( &statbuf, &newstatbuf, sizeof( struct stat ) );
+                    continue;
+                }
+                else
+                {
+                    break;
+                }
             }
         }
+
+        /* File is stable, let's grab stuff from it */
+        ret =  _getTargetProgramInfo( s );
     }
 
-    /* If we reach here we weren't successful, so delete the allocated memory */
-    SymbolSetDelete( &s );
-    return NULL;
+    if ( ret != SYMBOL_OK )
+    {
+        SymbolSetDelete( &s );
+        s = NULL;
+    }
+
+    *ss = s;
+    return ret;
 }
+#pragma GCC diagnostic pop
 // ====================================================================================================

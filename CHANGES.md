@@ -1,5 +1,60 @@
-Version 2.0.0 in Progress
+21st Sept 2024 (Version 2.2.0)
 
+* Add COBS draining state to re-sync as quickly as possible
+* Report when client is disconnected for not keeping up
+* Addition of orbflow support (COBS over arbitary bearer with protocol on top)
+* Support for ORBTrace 1.4 series gateware
+* Support in-probe TPIU frame stripping
+* Support TPIU frames in orbflow tag 1
+* Individual clients no longer decode TPIU - use orbuculum mux if you need this
+* Update saved file format to differentiate orbflow files from legacy
+* Simplification of client handling (speedup and less crud)
+* Various incremental improvements
+* FreeBSD support
+* orbtop: fix incremental memory use over time
+* Python support moved to its own project
+* Improved statistics reporting accurary
+* Search for dynamic bmp endpoint
+* Add pacing support for read from file
+* Ensure utilities respect CTRL-C even when orbuculum mux is not available
+* improved support for C++
+* Addition of ETM4 decode (experimental)
+* Timestamping for orbtop, in various formats
+* Colour support in orbcat for metadata (timestamps)
+* Exception reporting for orbtop
+* OSX CI Builder support
+* Orbuculum can now be used as a meson subproject
+* sam5 session setup support
+* NXP IMXRT117x session setup support
+* s32K344 session setup support
+* TM4C session setup support
+
+30th June 2023 (Version 2.1.0)
+
+* Support for host side and device side timestamping in orbtop
+* Stability improvements
+* Move to ninja/meson build system
+* Cleaner stream abstraction for data sourcing
+* Improved orbtop interval monotonicity
+* Improved shutdown and error handling for orbuculum mux
+* Suite and connected probe version reporting
+* UART configuration in orbtrace for ORBTrace Mini
+* Move to separate library to support third party tooling
+* Better max interrupt depth tracking under overload conditions
+* Automated udev and gdb init files installation in Linux builds
+* Changes to usb transfer arrangments for improved performance
+* Orbtop gains wall time and interrupt utilisation percentage
+* Support for SWO over UART speed setting on ORBTRrace
+* Improved OSX support
+* Much improved windows support
+* Python support
+* Addition of orblcd utility for host-side emulation of lcd panels.
+
+ (Version 2.0.0)
+* Significant simplifications to the orbuculum mux to reduce load/improve throughput
+* New longopts & some name changes to options
+* makefile install and uninstall capability
+* orbtrace utility now supports SWO
 * Fix packet scheduling from orbuculum
 * Move to semantic numbering - 2.00 becomes 2.0.0. 
 * Various fixes in orbmortem for reliability and performance

@@ -16,15 +16,18 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <pthread.h>
-#include <signal.h>
 
 #include "git_version_info.h"
 #include "generics.h"
-#include "tpiuDecoder.h"
 #include "itmDecoder.h"
+#include "oflow.h"
 #include "fileWriter.h"
 #include "itmfifos.h"
 #include "msgDecoder.h"
+
+#ifndef O_BINARY
+    #define O_BINARY 0
+#endif
 
 #define MAX_STRING_LENGTH (100)              /* Maximum length that will be output from a fifo for a single event */
 
@@ -46,6 +49,7 @@ struct Channel                               /* Information for an individual ch
     pthread_t thread;                        /* Thread on which it's running */
     struct runThreadParams params;           /* Parameters for running thread */
     char *fifoName;                          /* Constructed fifo name (from chanPath and name) */
+    bool ending;                             /* Flag indicating its time to disappear */
 };
 
 struct itmfifosHandle
@@ -54,8 +58,7 @@ struct itmfifosHandle
     /* The decoders and the packets from them */
     struct ITMDecoder i;
     struct ITMPacket h;
-    struct TPIUDecoder t;
-    struct TPIUPacket p;
+    struct OFLOW ot;
     enum timeDelay timeStatus;                    /* Indicator of if this time is exact */
     uint64_t timeStamp;                           /* Latest received time */
 
@@ -64,11 +67,13 @@ struct itmfifosHandle
 
     /* Configuration information */
     char *chanPath;                               /* Path to where to put the fifos */
-    bool useTPIU;                                 /* Is the TPIU active? */
     bool filewriter;                              /* Is the filewriter in use? */
     bool forceITMSync;                            /* Is ITM to be forced into sync? */
     bool permafile;                               /* Use permanent files rather than fifos */
-    int tpiuITMChannel;                           /* TPIU channel on which ITM appears */
+    int tag;                                      /* Which OFLOW stream are we decoding? */
+    bool amEnding;                                /* Flag indicating end is in progress */
+
+    enum Prot protocol;                           /* What protocol to communicate (default to OFLOW (== orbuculum)) */
 
     struct Channel c[NUM_CHANNELS + 1];           /* Output for each channel */
 };
@@ -115,22 +120,24 @@ static void *_runFifo( void *arg )
 
     do
     {
-        /* Keep on opening the file (in case the fifo is opened/closed multiple times */
+        /* Keep on opening the file (in case the fifo is opened/closed multiple times) */
+        /* We use RDWR to allow the open to proceed without a remote end */
+
         if ( !params->permafile )
         {
-            opfile = open( c->fifoName, O_WRONLY );
+            opfile = open( c->fifoName, O_RDWR | O_BINARY | O_NONBLOCK );
         }
         else
         {
-            opfile = open( c->fifoName, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH );
+            opfile = open( c->fifoName, O_WRONLY | O_CREAT | O_BINARY  | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH );
         }
 
         do
         {
-            /* ....get the packet */
+            /* ....get the packet. This will hang here until a packet arrives or the link closes */
             readDataLen = read( params->listenHandle, &m, sizeof( struct swMsg ) );
 
-            if ( readDataLen <= 0 )
+            if ( readDataLen < 0 )
             {
                 continue;
             }
@@ -172,11 +179,12 @@ static void *_runFifo( void *arg )
                 written = write( opfile, &w, sizeof ( w ) );
             }
         }
-        while ( ( readDataLen > 0 ) && ( written > 0 ) );
+        while ( ( written > 0 ) && ( !c->ending ) );
 
+        /* Falling out on writen fail means we can re-open the fifo if it overflowed */
         close( opfile );
     }
-    while ( readDataLen > 0 );
+    while ( !c->ending );
 
     pthread_exit( NULL );
 }
@@ -208,16 +216,17 @@ static void *_runHWFifo( void *arg )
     {
         if ( !params->permafile )
         {
-            opfile = open( c->fifoName, O_WRONLY );
+            /* We use RDWR to allow the open to proceed without a remote end */
+            opfile = open( c->fifoName, O_RDWR | O_BINARY | O_NONBLOCK );
         }
         else
         {
-            opfile = open( c->fifoName, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH );
+            opfile = open( c->fifoName, O_WRONLY | O_CREAT | O_BINARY  | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH );
         }
 
         do
         {
-            /* ....get the packet, don't worry if it can't be written */
+            /* ....get the packet. We will hang here until a packet arrives or the link closes */
             readDataLen = read( params->listenHandle, p, MAX_STRING_LENGTH );
 
             if ( readDataLen > 0 )
@@ -225,18 +234,13 @@ static void *_runHWFifo( void *arg )
                 writeDataLen = write( opfile, p, readDataLen );
             }
         }
-        while ( ( readDataLen > 0 ) && ( writeDataLen > 0 ) );
+        while ( ( writeDataLen > 0 ) && ( !c->ending ) );
 
+        /* Falling out on writeDataLen fail means we can re-open the fifo if it overflowed */
         close( opfile );
     }
-    while ( readDataLen > 0 );
+    while ( !c->ending );
 
-    pthread_exit( NULL );
-}
-// ====================================================================================================
-static void _intEINTRHandler( int sig )
-
-{
     pthread_exit( NULL );
 }
 // ====================================================================================================
@@ -423,7 +427,7 @@ void _itmPumpProcess( struct itmfifosHandle *f, char c )
 {
     struct msg decoded;
 
-    typedef void ( *handlers )( void *decoded, struct itmfifosHandle * f );
+    typedef void ( *handlers )( void *, struct itmfifosHandle * f );
 
     /* Handlers for each complete message received */
     static const handlers h[MSG_NUM_MSGS] =
@@ -486,63 +490,29 @@ void _itmPumpProcess( struct itmfifosHandle *f, char c )
     }
 }
 // ====================================================================================================
-static void _tpiuProtocolPump( struct itmfifosHandle *f, uint8_t c )
+
+static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
 
 {
-    switch ( TPIUPump( &f->t, c ) )
+    struct itmfifosHandle *f = ( struct itmfifosHandle * )param;
+
+    if ( !p->good )
     {
-        // ------------------------------------
-        case TPIU_EV_NEWSYNC:
-            genericsReport( V_INFO, "TPIU In Sync (%d)" EOL, TPIUDecoderGetStats( &f->t )->syncCount );
-
-        // This fall-through is deliberate
-        case TPIU_EV_SYNCED:
-
-            ITMDecoderForceSync( &f->i, true );
-            break;
-
-        // ------------------------------------
-        case TPIU_EV_RXING:
-        case TPIU_EV_NONE:
-            break;
-
-        // ------------------------------------
-        case TPIU_EV_UNSYNCED:
-            genericsReport( V_INFO, "TPIU Lost Sync (%d)" EOL, TPIUDecoderGetStats( &f->t )->lostSync );
-            ITMDecoderForceSync( &f->i, false );
-            break;
-
-        // ------------------------------------
-        case TPIU_EV_RXEDPACKET:
-            if ( !TPIUGetPacket( &f->t, &f->p ) )
+        genericsReport( V_INFO, "Bad packet received" EOL );
+    }
+    else
+    {
+        if ( p->tag == f->tag )
+        {
+            for ( int i = 0; i < p->len; i++ )
             {
-                genericsReport( V_WARN, "TPIUGetPacket fell over" EOL );
+                _itmPumpProcess( f, p->d[i] );
             }
-
-            for ( uint32_t g = 0; g < f->p.len; g++ )
-            {
-                if ( f->p.packet[g].s == f->tpiuITMChannel )
-                {
-                    _itmPumpProcess( f, f->p.packet[g].d );
-                    continue;
-                }
-
-                /* Its perfectly legal for TPIU channels to arrive that we aren't interested in */
-                if ( ( f->p.packet[g].s != 0 ) && ( f->p.packet[g].s != 0x7f ) )
-                {
-                    genericsReport( V_INFO, "Unhandled TPIU channel %02x" EOL, f->p.packet[g].s );
-                }
-            }
-
-            break;
-
-        // ------------------------------------
-        case TPIU_EV_ERROR:
-            genericsReport( V_ERROR, "****ERROR****" EOL );
-            break;
-            // ------------------------------------
+        }
     }
 }
+
+// ====================================================================================================
 
 // ====================================================================================================
 // ====================================================================================================
@@ -567,6 +537,12 @@ void itmfifoSetChanPath( struct itmfifosHandle *f, char *s )
 }
 
 // ====================================================================================================
+// strdup leak is deliberately ignored. That is the central purpose of this code!
+#pragma GCC diagnostic push
+#if !defined(__clang__)
+    #pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
+#endif
+
 void itmfifoSetChannel( struct itmfifosHandle *f, int chan, char *n, char *s )
 
 {
@@ -577,14 +553,24 @@ void itmfifoSetChannel( struct itmfifosHandle *f, int chan, char *n, char *s )
         free( f->c[chan].presFormat );
     }
 
+    if ( f->c[chan].chanName )
+    {
+        free( f->c[chan].chanName );
+    }
+
     f->c[chan].chanName = strdup( n );
+
+    MEMCHECKV( f->c[chan].chanName );
     f->c[chan].presFormat = s ? strdup( s ) : NULL;
+
+    MEMCHECKV( f->c[chan].presFormat );
 }
+#pragma GCC diagnostic pop
 // ====================================================================================================
-void itmfifoSetUseTPIU( struct itmfifosHandle *f, bool s )
+void itmfifoSetProtocol( struct itmfifosHandle *f, enum Prot p )
 
 {
-    f->useTPIU = s;
+    f->protocol = p;
 }
 // ====================================================================================================
 void itmfifoSetForceITMSync( struct itmfifosHandle *f, bool s )
@@ -593,10 +579,10 @@ void itmfifoSetForceITMSync( struct itmfifosHandle *f, bool s )
     f->forceITMSync = s;
 }
 // ====================================================================================================
-void itmfifoSettpiuITMChannel( struct itmfifosHandle *f, int channel )
+void itmfifoSettag( struct itmfifosHandle *f, int stream )
 
 {
-    f->tpiuITMChannel = channel;
+    f->tag = stream;
 }
 // ====================================================================================================
 char *itmfifoGetChannelName( struct itmfifosHandle *f, int chan )
@@ -619,10 +605,10 @@ char *itmfifoGetChanPath( struct itmfifosHandle *f )
     return f->chanPath;
 }
 // ====================================================================================================
-bool itmfifoGetUseTPIU( struct itmfifosHandle *f )
+enum Prot itmfifoGetProtocol( struct itmfifosHandle *f )
 
 {
-    return f->useTPIU;
+    return f->protocol;
 }
 // ====================================================================================================
 bool itmfifoGetForceITMSync( struct itmfifosHandle *f )
@@ -631,16 +617,10 @@ bool itmfifoGetForceITMSync( struct itmfifosHandle *f )
     return f->forceITMSync;
 }
 // ====================================================================================================
-int itmfifoGettpiuITMChannel( struct itmfifosHandle *f )
+int itmfifoGettag( struct itmfifosHandle *f )
 
 {
-    return f->tpiuITMChannel;
-}
-// ====================================================================================================
-struct TPIUCommsStats *itmfifoGetCommsStats( struct itmfifosHandle *f )
-
-{
-    return TPIUGetCommsStats( &f->t );
+    return f->tag;
 }
 // ====================================================================================================
 struct ITMDecoderStats *fifoGetITMDecoderStats( struct itmfifosHandle *f )
@@ -651,28 +631,29 @@ struct ITMDecoderStats *fifoGetITMDecoderStats( struct itmfifosHandle *f )
 // ====================================================================================================
 // Main interface components
 // ====================================================================================================
-void itmfifoProtocolPump( struct itmfifosHandle *f, uint8_t c )
+void itmfifoProtocolPump( struct itmfifosHandle *f, uint8_t *c, int len )
 
 /* Top level protocol pump */
 
 {
-    if ( f->useTPIU )
+
+    if ( PROT_OFLOW == f->protocol )
     {
-        _tpiuProtocolPump( f, c );
+        OFLOWPump( &f->ot, c, len, _OFLOWpacketRxed, f );
     }
     else
-    {
-        /* There's no TPIU in use, so this goes straight to the ITM layer */
-        _itmPumpProcess( f, c );
-    }
+        while ( len-- )
+        {
+            /* There's no TPIU in use, so this goes straight to the ITM layer */
+            _itmPumpProcess( f, *c++ );
+        }
 }
 // ====================================================================================================
 void itmfifoForceSync( struct itmfifosHandle *f, bool synced )
 
-/* Reset TPIU state and put ITM into defined state */
+/* Reset and put ITM into defined state */
 
 {
-    TPIUDecoderForceSync( &f->t, 0 );
     ITMDecoderForceSync( &f->i, synced );
 }
 // ====================================================================================================
@@ -686,8 +667,8 @@ bool itmfifoCreate( struct itmfifosHandle *f )
     /* Make sure there's an initial timestamp to work with */
     f->lastHWExceptionTS = genericsTimestampuS();
 
-    /* Reset the TPIU handler before we start */
-    TPIUDecoderInit( &f->t );
+    /* Reset the handler before we start */
+    OFLOWInit( &f->ot );
     ITMDecoderInit( &f->i, f->forceITMSync );
 
     /* Cycle through channels and create a fifo for each one that is enabled */
@@ -710,14 +691,21 @@ bool itmfifoCreate( struct itmfifosHandle *f )
                 }
 
                 f->c[t].handle = fd[1];
+                f->c[t].ending = false;
 
                 f->c[t].params.listenHandle = fd[0];
                 f->c[t].params.portNo = t;
                 f->c[t].params.permafile = f->permafile;
                 f->c[t].params.c = &f->c[t];
 
-                f->c[t].fifoName = ( char * )malloc( strlen( f->c[t].chanName ) + strlen( f->chanPath ) + 2 );
-                strcpy( f->c[t].fifoName, f->chanPath );
+                f->c[t].fifoName = ( char * )calloc( strlen( f->c[t].chanName ) + 2 + ( f->chanPath ? strlen( f->chanPath ) : 0 ), 1 );
+
+                if ( f->chanPath )
+                {
+                    strcpy( f->c[t].fifoName, f->chanPath );
+                    strcat( f->c[t].fifoName, "/" );
+                }
+
                 strcat( f->c[t].fifoName, f->c[t].chanName );
 
                 if ( pthread_create( &( f->c[t].thread ), NULL, &_runFifo, &( f->c[t].params ) ) )
@@ -747,8 +735,14 @@ bool itmfifoCreate( struct itmfifosHandle *f )
             f->c[t].params.permafile = f->permafile;
             f->c[t].params.c = &f->c[t];
 
-            f->c[t].fifoName = ( char * )malloc( strlen( HWFIFO_NAME ) + strlen( f->chanPath ) + 2 );
-            strcpy( f->c[t].fifoName, f->chanPath );
+            f->c[t].fifoName = ( char * )calloc( strlen( HWFIFO_NAME ) + 2 + ( ( f->chanPath ) ? strlen( f->chanPath ) : 0 ), 1 );
+
+            if ( f->chanPath )
+            {
+                strcpy( f->c[t].fifoName, f->chanPath );
+                strcat( f->c[t].fifoName, "/" );
+            }
+
             strcat( f->c[t].fifoName, HWFIFO_NAME );
 
             if ( pthread_create( &( f->c[t].thread ), NULL, &_runHWFifo, &( f->c[t].params ) ) )
@@ -766,18 +760,22 @@ void itmfifoShutdown( struct itmfifosHandle *f )
 /* Destroy the per-port sub-processes. These will terminate when the fifos close */
 
 {
-    if ( !f )
+    if ( f->amEnding )
     {
         return;
     }
 
+    f->amEnding = true;
+
     /* Firstly go tell everything they're doomed */
     for ( int t = 0; t < NUM_CHANNELS + 1; t++ )
     {
+        f->c[t].ending = true;
+
         if ( f->c[t].handle > 0 )
         {
+            /* This will cause the read to end, thus terminating the pthread */
             close( f->c[t].handle );
-            pthread_kill ( f->c[t].thread, EINTR );
         }
     }
 
@@ -800,8 +798,6 @@ void itmfifoShutdown( struct itmfifosHandle *f )
             free( f->c[t].presFormat );
         }
     }
-
-    free( f );
 }
 // ====================================================================================================
 
@@ -823,21 +819,17 @@ void itmfifoUsePermafiles( struct itmfifosHandle *f, bool usePermafilesSet )
     f->permafile = usePermafilesSet;
 }
 // ====================================================================================================
-struct itmfifosHandle *itmfifoInit( bool forceITMSyncSet, bool useTPIUSet, int TPIUchannelSet )
+struct itmfifosHandle *itmfifoInit( bool forceITMSyncSet, enum Prot p, int tag )
 
 {
     struct itmfifosHandle *f = ( struct itmfifosHandle * )calloc( 1, sizeof( struct itmfifosHandle  ) );
+
+    MEMCHECK( f, NULL );
+
     f->chanPath = strdup( "" );
-    f->useTPIU = useTPIUSet;
+    f->protocol = p;
     f->forceITMSync = forceITMSyncSet;
-    f->tpiuITMChannel = TPIUchannelSet;
-
-    /* Trap EINTR so we can use it to interrupt reads/writes in the threads */
-    if ( SIG_ERR == signal( EINTR, _intEINTRHandler ) )
-    {
-        genericsExit( -1, "Failed to establish EINTR handler" EOL );
-    }
-
+    f->tag = tag;
     return f;
 }
 // ====================================================================================================

@@ -19,14 +19,17 @@
 #include <string.h>
 #include <assert.h>
 #include <signal.h>
+#include <getopt.h>
 
 #include "git_version_info.h"
 #include "generics.h"
 #include "fileWriter.h"
+#include "stream.h"
 #include "nw.h"
 
 #include "itmfifos.h"
 
+const char *protString[] = {"OFLOW", "ITM", NULL};
 
 //#define DUMP_BLOCK
 
@@ -41,13 +44,14 @@ struct
     /* Source information */
     char *file;                         /* File host connection */
     bool fileTerminate;                 /* Terminate when file read isn't successful */
+    bool mono;                                          /* Supress colour in output */
 
     int port;                           /* Source information */
     char *server;
 
 } options =
 {
-    .port = NWCLIENT_SERVER_PORT,
+    .port = OFCLIENT_SERVER_PORT,
     .server = "localhost"
 };
 
@@ -64,40 +68,66 @@ struct
 // ====================================================================================================
 // ====================================================================================================
 // ====================================================================================================
-static void _intHandler( int sig )
+static void _printHelp( const char *const progName )
 
 {
-    /* CTRL-C exit is not an error... */
-    exit( 0 );
+    genericsPrintf( "Usage: %s [options]" EOL, progName );
+    genericsPrintf( "    -b, --basedir:      <basedir> for channels" EOL );
+    genericsPrintf( "    -c, --channel:      <Number>,<Name>,<Format> of channel to populate (repeat per channel)" EOL );
+    genericsPrintf( "    -E, --eof:          When reading from file, terminate at end of file" EOL );
+    genericsPrintf( "    -f, --input-file:   <filename> Take input from specified file" EOL );
+    genericsPrintf( "    -h, --help:         This help" EOL );
+    genericsPrintf( "    -M, --no-colour:    Supress colour in output" EOL );
+    genericsPrintf( "    -P, --permanent:    Create permanent files rather than fifos" EOL );
+    genericsPrintf( "    -p, --protocol:     Protocol to communicate. Defaults to OFLOW if -s is not set, otherwise ITM" EOL );
+    genericsPrintf( "    -s, --server:       <Server>:<Port> to use" EOL );
+    genericsPrintf( "    -t, --tag:          <stream> Which OFLOW tag to use (normally 1)" EOL );
+    genericsPrintf( "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsPrintf( "    -V, --version:      Print version and exit" EOL );
+    genericsPrintf( "    -W, --writer-path:  <path> Enable filewriter functionality using specified base path" EOL );
 }
 // ====================================================================================================
-static void _printHelp( char *progName )
+void _printVersion( void )
 
 {
-    genericsPrintf( "Usage: %s [Options]" EOL, progName );
-    genericsPrintf( "       -b <basedir> for channels" EOL );
-    genericsPrintf( "       -c <Number>,<Name>,<Format> of channel to populate (repeat per channel)" EOL );
-    genericsPrintf( "       -e When reading from file, terminate at end of file rather than waiting for further input" EOL );
-    genericsPrintf( "       -f <filename> Take input from specified file" EOL );
-    genericsPrintf( "       -h This help" EOL );
-    genericsPrintf( "       -P Create permanent files rather than fifos" EOL );
-    genericsPrintf( "       -t <channel> Use TPIU decoder on specified channel (normally 1)" EOL );
-    genericsPrintf( "       -v <level> Verbose mode 0(errors)..3(debug)" EOL );
-    genericsPrintf( "       -w <path> Enable filewriter functionality using specified base path" EOL );
+    genericsPrintf( "orbfifo version " GIT_DESCRIBE );
 }
 // ====================================================================================================
-static int _processOptions( int argc, char *argv[] )
+struct option _longOptions[] =
+{
+    {"basedir", required_argument, NULL, 'b'},
+    {"channel", required_argument, NULL, 'c'},
+    {"eof", no_argument, NULL, 'E'},
+    {"input-file", required_argument, NULL, 'f'},
+    {"help", no_argument, NULL, 'h'},
+    {"no-colour", no_argument, NULL, 'M'},
+    {"no-color", no_argument, NULL, 'M'},
+    {"permanent", no_argument, NULL, 'P'},
+    {"protocol", required_argument, NULL, 'p'},
+    {"server", required_argument, NULL, 's'},
+    {"tag", required_argument, NULL, 't'},
+    {"verbose", required_argument, NULL, 'v'},
+    {"version", no_argument, NULL, 'V'},
+    {"writer-path", required_argument, NULL, 'W'},
+    {NULL, no_argument, NULL, 0}
+};
+// ====================================================================================================
+static bool _processOptions( int argc, char *argv[] )
 
 {
-    int c;
+    int c, optionIndex = 0;
 #define DELIMITER ','
 
     char *chanConfig;
     char *chanName;
     uint chan;
     char *chanIndex;
+    bool protExplicit = false;
+    bool serverExplicit = false;
+    bool portExplicit = false;
+    enum Prot p;
 
-    while ( ( c = getopt ( argc, argv, "b:c:ef:hn:Pt:v:w:" ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "b:c:Ef:hVn:Pp:s:t:v:w:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
@@ -107,7 +137,7 @@ static int _processOptions( int argc, char *argv[] )
                 break;
 
             // ------------------------------------
-            case 'e':
+            case 'E':
                 options.fileTerminate = true;
                 break;
 
@@ -124,7 +154,16 @@ static int _processOptions( int argc, char *argv[] )
                 return false;
 
             // ------------------------------------
+            case 'V':
+                _printVersion();
+                return false;
 
+            // ------------------------------------
+            case 'M':
+                options.mono = true;
+                break;
+
+            // ------------------------------------
             case 'n':
                 itmfifoSetForceITMSync( _r.f, false );
                 break;
@@ -137,20 +176,79 @@ static int _processOptions( int argc, char *argv[] )
 
             // ------------------------------------
 
+            case 'p':
+                p = PROT_UNKNOWN;
+                protExplicit = true;
+
+                for ( int i = 0; protString[i]; i++ )
+                {
+                    if ( !strcmp( protString[i], optarg ) )
+                    {
+                        p = i;
+                        break;
+                    }
+                }
+
+                if ( PROT_UNKNOWN == p )
+                {
+                    genericsReport( V_ERROR, "Unrecognised protocol type" EOL );
+                    return false;
+                }
+
+                itmfifoSetProtocol( _r.f, p );
+                break;
+
+            // ------------------------------------
+            case 's':
+                options.server = optarg;
+                serverExplicit = true;
+
+                // See if we have an optional port number too
+                char *a = optarg;
+
+                while ( ( *a ) && ( *a != ':' ) )
+                {
+                    a++;
+                }
+
+                if ( *a == ':' )
+                {
+                    *a = 0;
+                    options.port = atoi( ++a );
+                }
+
+                if ( !options.port )
+                {
+                    options.port = NWCLIENT_SERVER_PORT;
+                }
+                else
+                {
+                    portExplicit = true;
+                }
+
+                break;
+
+            // ------------------------------------
+
             case 't':
-                itmfifoSetUseTPIU( _r.f, true );
-                itmfifoSettpiuITMChannel( _r.f, atoi( optarg ) );
+                itmfifoSettag( _r.f, atoi( optarg ) );
                 break;
 
             // ------------------------------------
 
             case 'v':
+                if ( !isdigit( *optarg ) )
+                {
+                    genericsReport( V_ERROR, "-v requires a numeric argument." EOL );
+                    return false;
+                }
+
                 genericsSetReportLevel( atoi( optarg ) );
                 break;
 
             // ------------------------------------
 
-            case 'w':
+            case 'W':
                 options.filewriter = true;
                 options.fwbasedir = optarg;
                 break;
@@ -160,11 +258,19 @@ static int _processOptions( int argc, char *argv[] )
             /* Individual channel setup */
             case 'c':
                 chanIndex = chanConfig = strdup( optarg );
+
+                if ( NULL == chanConfig )
+                {
+                    genericsReport( V_ERROR, "Couldn't allocate memory at %s::%d" EOL, __FILE__, __LINE__ );
+                    return false;
+                }
+
                 chan = atoi( optarg );
 
                 if ( chan >= NUM_CHANNELS )
                 {
                     genericsReport( V_ERROR, "Channel index out of range" EOL );
+                    free( chanConfig );
                     return false;
                 }
 
@@ -177,6 +283,7 @@ static int _processOptions( int argc, char *argv[] )
                 if ( !*chanIndex )
                 {
                     genericsReport( V_ERROR, "No filename for channel %d" EOL, chan );
+                    free( chanConfig );
                     return false;
                 }
 
@@ -220,20 +327,21 @@ static int _processOptions( int argc, char *argv[] )
                 // ------------------------------------
         }
 
-    /* ... and dump the config if we're being verbose */
-    genericsReport( V_INFO, "%s V" VERSION " (Git %08X %s, Built " BUILD_DATE ")" EOL, argv[0], GIT_HASH, ( GIT_DIRTY ? "Dirty" : "Clean" ) );
-    genericsReport( V_INFO, "BasePath    : %s" EOL, itmfifoGetChanPath( _r.f ) );
-    genericsReport( V_INFO, "ForceSync   : %s" EOL, itmfifoGetForceITMSync( _r.f ) ? "true" : "false" );
-    genericsReport( V_INFO, "Permafile   : %s" EOL, options.permafile ? "true" : "false" );
+    /* If we set an explicit server and port and didn't set a protocol chances are we want ITM, not OFLOW */
+    if ( serverExplicit && !protExplicit )
+    {
+        itmfifoSetProtocol( _r.f, PROT_ITM );
+    }
 
-    if ( itmfifoGetUseTPIU( _r.f ) )
+    if ( ( itmfifoGetProtocol( _r.f ) == PROT_ITM ) && !portExplicit )
     {
-        genericsReport( V_INFO, "Using TPIU  : true (ITM on channel %d)" EOL, itmfifoGettpiuITMChannel( _r.f ) );
+        options.port = NWCLIENT_SERVER_PORT;
     }
-    else
-    {
-        genericsReport( V_INFO, "Using TPIU  : false" EOL );
-    }
+
+
+    /* ... and dump the config if we're being verbose */
+    genericsReport( V_INFO, "orbfifo version " GIT_DESCRIBE EOL );
+    genericsReport( V_INFO, "Server     : %s:%d" EOL, options.server, options.port );
 
     if ( options.file )
     {
@@ -247,6 +355,22 @@ static int _processOptions( int argc, char *argv[] )
         {
             genericsReport( V_INFO, " (Ongoing read)" EOL );
         }
+    }
+
+
+    switch ( itmfifoGetProtocol( _r.f ) )
+    {
+        case PROT_OFLOW:
+            genericsReport( V_INFO, "Decoding OFLOW (Orbuculum) with ITM in stream %d" EOL, itmfifoGettag( _r.f ) );
+            break;
+
+        case PROT_ITM:
+            genericsReport( V_INFO, "Decoding ITM" EOL );
+            break;
+
+        default:
+            genericsReport( V_INFO, "Decoding unknown" EOL );
+            break;
     }
 
     genericsReport( V_INFO, "Channels    :" EOL );
@@ -291,10 +415,7 @@ static void _processBlock( int s, unsigned char *cbw )
 
 #endif
 
-        while ( s-- )
-        {
-            itmfifoProtocolPump( _r.f, *cbw++ );
-        }
+        itmfifoProtocolPump( _r.f, cbw, s );
     }
 
 }
@@ -307,24 +428,27 @@ static void _doExit( void )
     /* Give them a bit of time, then we're leaving anyway */
     usleep( 200 );
 }
+
+// ====================================================================================================
+static void _intHandler( int sig )
+
+{
+    /* CTRL-C exit is not an error... */
+    _doExit();
+}
+
 // ====================================================================================================
 int main( int argc, char *argv[] )
 
 {
-    int sourcefd;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
     uint8_t cbw[TRANSFER_SIZE];
-    int flag = 1;
-
-    ssize_t t;
+    size_t t;
+    struct Stream *stream = NULL;
     int64_t lastTime;
-    int r;
     struct timeval tv;
-    fd_set readfds;
-    int32_t remainTime;
+    uint64_t remainTime;
 
-    /* Setup fifos with forced ITM sync, no TPIU and TPIU on channel 1 if its engaged later */
+    /* Setup fifos with forced ITM sync, tag 1 */
     _r.f = itmfifoInit( true, false, 1 );
     assert( _r.f );
 
@@ -333,6 +457,8 @@ int main( int argc, char *argv[] )
         /* processOptions generates its own error messages */
         genericsExit( -1, "" EOL );
     }
+
+    genericsScreenHandling( !options.mono );
 
     itmfifoUsePermafiles( _r.f, options.permafile );
 
@@ -364,103 +490,57 @@ int main( int argc, char *argv[] )
 
     while ( !_r.ending )
     {
-        if ( !options.file )
+        if ( options.file != NULL )
         {
-            /* Get the socket open */
-            sourcefd = socket( AF_INET, SOCK_STREAM, 0 );
-            setsockopt( sourcefd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof( flag ) );
-
-            if ( sourcefd < 0 )
-            {
-                perror( "Error creating socket\n" );
-                return -EIO;
-            }
-
-            if ( setsockopt( sourcefd, SOL_SOCKET, SO_REUSEADDR, &( int )
-        {
-            1
-        }, sizeof( int ) ) < 0 )
-            {
-                perror( "setsockopt(SO_REUSEADDR) failed" );
-                return -EIO;
-            }
-
-            /* Now open the network connection */
-            bzero( ( char * ) &serv_addr, sizeof( serv_addr ) );
-            server = gethostbyname( options.server );
-
-            if ( !server )
-            {
-                perror( "Cannot find host" );
-                return -EIO;
-            }
-
-            serv_addr.sin_family = AF_INET;
-            bcopy( ( char * )server->h_addr,
-                   ( char * )&serv_addr.sin_addr.s_addr,
-                   server->h_length );
-            serv_addr.sin_port = htons( options.port );
-
-            if ( connect( sourcefd, ( struct sockaddr * ) &serv_addr, sizeof( serv_addr ) ) < 0 )
-            {
-                genericsPrintf( CLEAR_SCREEN EOL );
-
-                perror( "Could not connect" );
-                close( sourcefd );
-                usleep( 1000000 );
-                continue;
-            }
+            stream = streamCreateFile( options.file );
         }
         else
         {
-            if ( ( sourcefd = open( options.file, O_RDONLY ) ) < 0 )
+            while ( !_r.ending )
             {
-                genericsExit( sourcefd, "Can't open file %s" EOL, options.file );
+                stream = streamCreateSocket( options.server, options.port );
+
+                if ( stream )
+                {
+                    break;
+                }
+
+                genericsReport( V_INFO, "Could not connect" EOL );
+                usleep( 1000000 );
             }
         }
 
         while ( !_r.ending )
         {
-            remainTime = ( ( lastTime + 1000 - genericsTimestampmS() ) * 1000 ) - 500;
-
-            r = t = 0;
+            remainTime = ( ( lastTime + 1000000 - genericsTimestampuS() ) );
 
             if ( remainTime > 0 )
             {
                 tv.tv_sec = remainTime / 1000000;
                 tv.tv_usec  = remainTime % 1000000;
-
-                FD_ZERO( &readfds );
-                FD_SET( sourcefd, &readfds );
-                r = select( sourcefd + 1, &readfds, NULL, NULL, &tv );
             }
 
-            if ( r < 0 )
+            enum ReceiveResult result = stream->receive( stream, cbw, TRANSFER_SIZE, &tv, ( size_t * )&t );
+
+            if ( ( result == RECEIVE_RESULT_EOF ) || ( result == RECEIVE_RESULT_ERROR ) )
             {
-                /* Something went wrong in the select */
                 break;
             }
 
-            if ( r > 0 )
-            {
-                t = read( sourcefd, cbw, TRANSFER_SIZE );
-
-                if ( t <= 0 )
-                {
-                    /* We are at EOF (Probably the descriptor closed) */
-                    break;
-                }
-
-                /* Pump all of the data through the protocol handler */
-                _processBlock( t, cbw );
-            }
+            _processBlock( t, cbw );
         }
 
-        close( sourcefd );
+
+        if ( stream )
+        {
+            stream->close( stream );
+            free( stream );
+            stream = NULL;
+        }
 
         if ( options.fileTerminate )
         {
-            _r.ending = true;
+            break;
         }
     }
 

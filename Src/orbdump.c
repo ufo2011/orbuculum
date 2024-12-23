@@ -9,16 +9,16 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <stdio.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
+#include <getopt.h>
+#include <signal.h>
 
 #include "generics.h"
 #include "uthash.h"
 #include "git_version_info.h"
 #include "generics.h"
-#include "tpiuDecoder.h"
+#include "oflow.h"
 #include "itmDecoder.h"
+#include "stream.h"
 
 #include "nw.h"
 
@@ -27,35 +27,39 @@
 #define DEFAULT_OUTFILE "/dev/stdout"
 #define DEFAULT_TIMELEN 10000
 
+enum Prot { PROT_OFLOW, PROT_ITM, PROT_UNKNOWN };
+const char *protString[] = {"OFLOW", "ITM", NULL};
+
 /* ---------- CONFIGURATION ----------------- */
 
 struct                                      /* Record for options, either defaults or from command line */
 {
     /* Config information */
-    bool useTPIU;
     bool forceITMSync;
-    uint32_t tpiuITMChannel;
+    uint32_t tag;
 
     /* File to output dump to */
     char *outfile;
 
-    /* Do we need to write syncronously */
+    /* Do we need to write synchronously */
     bool writeSync;
 
     /* How long to dump */
     uint32_t timelen;
 
+    /* Supress colour in output */
+    bool mono;
     /* Source information */
     int port;
     char *server;
+    enum Prot protocol;
 } options =
 {
     .forceITMSync = true,
-    .useTPIU = false,
-    .tpiuITMChannel = 1,
+    .tag = 1,
     .outfile = DEFAULT_OUTFILE,
     .timelen = DEFAULT_TIMELEN,
-    .port = NWCLIENT_SERVER_PORT,
+    .port = OFCLIENT_SERVER_PORT,
     .server = "localhost"
 };
 
@@ -65,8 +69,8 @@ struct
     /* The decoders and the packets from them */
     struct ITMDecoder i;
     struct ITMPacket h;
-    struct TPIUDecoder t;
-    struct TPIUPacket p;
+    struct OFLOW c;
+    bool   ending;
 } _r;
 
 // ====================================================================================================
@@ -91,89 +95,55 @@ uint64_t _timestamp( void )
 // ====================================================================================================
 // ====================================================================================================
 // ====================================================================================================
-void _protocolPump( uint8_t c )
-
-/* Top level protocol pump */
+void _printHelp( const char *const progName )
 
 {
-    if ( options.useTPIU )
-    {
-        switch ( TPIUPump( &_r.t, c ) )
-        {
-            // ------------------------------------
-            case TPIU_EV_NEWSYNC:
-            case TPIU_EV_SYNCED:
-                ITMDecoderForceSync( &_r.i, true );
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_RXING:
-            case TPIU_EV_NONE:
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_UNSYNCED:
-                ITMDecoderForceSync( &_r.i, false );
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_RXEDPACKET:
-                if ( !TPIUGetPacket( &_r.t, &_r.p ) )
-                {
-                    genericsReport( V_WARN, "TPIUGetPacket fell over" EOL );
-                }
-
-                for ( uint32_t g = 0; g < _r.p.len; g++ )
-                {
-                    if ( _r.p.packet[g].s == options.tpiuITMChannel )
-                    {
-                        ITMPump( &_r.i, _r.p.packet[g].d );
-                        continue;
-                    }
-
-                    if ( _r.p.packet[g].s != 0 )
-                    {
-                        genericsReport( V_WARN, "Unknown TPIU channel %02x" EOL, _r.p.packet[g].s );
-                    }
-                }
-
-                break;
-
-            // ------------------------------------
-            case TPIU_EV_ERROR:
-                genericsReport( V_WARN, "****ERROR****" EOL );
-                break;
-                // ------------------------------------
-        }
-    }
-    else
-    {
-        /* There's no TPIU in use, so this goes straight to the ITM layer */
-        ITMPump( &_r.i, c );
-    }
+    genericsPrintf( "Usage: %s [options]" EOL, progName );
+    genericsPrintf( "    -h, --help:         This help" EOL );
+    genericsPrintf( "    -l, --length:       <timelen> Length of time in ms to record from point of acheiving sync (defaults to %dmS)" EOL, options.timelen );
+    genericsPrintf( "    -M, --no-colour:    Supress colour in output" EOL );
+    genericsPrintf( "    -n, --itm-sync:     Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
+    genericsPrintf( "    -o, --output-file:  <filename> to be used for dump file (defaults to %s)" EOL, options.outfile );
+    genericsPrintf( "    -p, --protocol:     Protocol to communicate. Defaults to OFLOW if -s is not set, otherwise ITM" EOL );
+    genericsPrintf( "    -s, --server:       <Server>:<Port> to use" EOL );
+    genericsPrintf( "    -t, --tag:          <stream> Which Orbflow tag to use (normally 1)" EOL );
+    genericsPrintf( "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsPrintf( "    -V, --version:      Print version and exit" EOL );
+    genericsPrintf( "    -w, --sync-write:   Write synchronously to the output file after every packet" EOL );
 }
 // ====================================================================================================
-void _printHelp( char *progName )
+void _printVersion( void )
 
 {
-    fprintf( stdout, "Usage: %s [options]" EOL, progName );
-    fprintf( stdout, "       -h: This help" EOL );
-    fprintf( stdout, "       -l: <timelen> Length of time in ms to record from point of acheiving sync (defaults to %dmS)" EOL, options.timelen );
-    fprintf( stdout, "       -n: Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
-    fprintf( stdout, "       -o: <filename> to be used for dump file (defaults to %s)" EOL, options.outfile );
-    fprintf( stdout, "       -p: <Port> to use" EOL );
-    fprintf( stdout, "       -s: <Server> to use" EOL );
-    fprintf( stdout, "       -t: <channel> Use TPIU decoder on specified channel, normally 1" EOL );
-    fprintf( stdout, "       -v: <level> Verbose mode 0(errors)..3(debug)" EOL );
-    fprintf( stdout, "       -w: Write syncronously to the output file after every packet" EOL );
+    genericsPrintf( "orbdump version " GIT_DESCRIBE EOL );
 }
 // ====================================================================================================
-int _processOptions( int argc, char *argv[] )
+static struct option _longOptions[] =
+{
+    {"help", no_argument, NULL, 'h'},
+    {"length", required_argument, NULL, 'l'},
+    {"itm-sync", no_argument, NULL, 'n'},
+    {"no-colour", no_argument, NULL, 'M'},
+    {"no-color", no_argument, NULL, 'M'},
+    {"output-file", required_argument, NULL, 'o'},
+    {"protocol", required_argument, NULL, 'p'},
+    {"server", required_argument, NULL, 's'},
+    {"tag", required_argument, NULL, 't'},
+    {"verbose", required_argument, NULL, 'v'},
+    {"version", no_argument, NULL, 'V'},
+    {"sync-write", no_argument, NULL, 'w'},
+    {NULL, no_argument, NULL, 0}
+};
+// ====================================================================================================
+bool _processOptions( int argc, char *argv[] )
 
 {
-    int c;
+    int c, optionIndex = 0;
+    bool protExplicit = false;
+    bool serverExplicit = false;
+    bool portExplicit = false;
 
-    while ( ( c = getopt ( argc, argv, "hl:no:p:s:t:v:w" ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "hVl:Mno:p:s:t:v:w", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             case 'o':
@@ -182,6 +152,10 @@ int _processOptions( int argc, char *argv[] )
 
             case 'l':
                 options.timelen = atoi( optarg );
+                break;
+
+            case 'M':
+                options.mono = true;
                 break;
 
             case 'n':
@@ -193,25 +167,80 @@ int _processOptions( int argc, char *argv[] )
                 break;
 
             case 'v':
+                if ( !isdigit( *optarg ) )
+                {
+                    genericsReport( V_ERROR, "-v requires a numeric argument." EOL );
+                    return false;
+                }
+
                 genericsSetReportLevel( atoi( optarg ) );
                 break;
 
             case 't':
-                options.useTPIU = true;
-                options.tpiuITMChannel = atoi( optarg );
+                options.tag = atoi( optarg );
                 break;
 
-            /* Source information */
+            // ------------------------------------
+
             case 'p':
-                options.port = atoi( optarg );
+                options.protocol = PROT_UNKNOWN;
+                protExplicit = true;
+
+                for ( int i = 0; protString[i]; i++ )
+                {
+                    if ( !strcmp( protString[i], optarg ) )
+                    {
+                        options.protocol = i;
+                        break;
+                    }
+                }
+
+                if ( options.protocol == PROT_UNKNOWN )
+                {
+                    genericsReport( V_ERROR, "Unrecognised protocol type" EOL );
+                    return false;
+                }
+
                 break;
 
+            // ------------------------------------
             case 's':
                 options.server = optarg;
+                serverExplicit = true;
+
+                // See if we have an optional port number too
+                char *a = optarg;
+
+                while ( ( *a ) && ( *a != ':' ) )
+                {
+                    a++;
+                }
+
+                if ( *a == ':' )
+                {
+                    *a = 0;
+                    options.port = atoi( ++a );
+                }
+
+                if ( !options.port )
+                {
+                    options.port = NWCLIENT_SERVER_PORT;
+                }
+                else
+                {
+                    portExplicit = true;
+                }
+
                 break;
 
+            // ------------------------------------
             case 'h':
                 _printHelp( argv[0] );
+                return false;
+
+            // ------------------------------------
+            case 'V':
+                _printVersion();
                 return false;
 
             case '?':
@@ -231,16 +260,21 @@ int _processOptions( int argc, char *argv[] )
                 return false;
         }
 
-    if ( ( options.useTPIU ) && ( !options.tpiuITMChannel ) )
+    /* If we set an explicit server and port and didn't set a protocol chances are we want ITM, not OFLOW */
+    if ( serverExplicit && !protExplicit )
     {
-        genericsReport( V_ERROR, "TPIU set for use but no channel set for ITM output" EOL );
-        return false;
+        options.protocol = PROT_ITM;
     }
 
-    genericsReport( V_INFO, "orbdump V" VERSION " (Git %08X %s, Built " BUILD_DATE ")" EOL, GIT_HASH, ( GIT_DIRTY ? "Dirty" : "Clean" ) );
+    if ( ( options.protocol == PROT_ITM ) && !portExplicit )
+    {
+        options.port = NWCLIENT_SERVER_PORT;
+    }
 
+    genericsReport( V_INFO, "orbdump version " GIT_DESCRIBE EOL );
     genericsReport( V_INFO, "Server    : %s:%d" EOL, options.server, options.port );
     genericsReport( V_INFO, "ForceSync : %s" EOL, options.forceITMSync ? "true" : "false" );
+
 
     if ( options.timelen )
     {
@@ -253,69 +287,112 @@ int _processOptions( int argc, char *argv[] )
 
     genericsReport( V_INFO, "Sync Write: %s" EOL, options.writeSync ? "true" : "false" );
 
-    if ( options.useTPIU )
+    switch ( options.protocol )
     {
-        genericsReport( V_INFO, "Using TPIU: true (ITM on channel %d)" EOL, options.tpiuITMChannel );
+        case PROT_OFLOW:
+            genericsReport( V_INFO, "Decoding OFLOW (Orbuculum) with ITM in stream %d" EOL, options.tag );
+            break;
+
+        case PROT_ITM:
+            genericsReport( V_INFO, "Decoding ITM" EOL );
+            break;
+
+        default:
+            genericsReport( V_INFO, "Decoding unknown" EOL );
+            break;
     }
 
     return true;
 }
+
 // ====================================================================================================
-int main( int argc, char *argv[] )
+
+static void _OFLOWpacketRxed ( struct OFLOWFrame *p, void *param )
 
 {
-    int sockfd;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
+    if ( !p->good )
+    {
+        genericsReport( V_INFO, "Bad packet received" EOL );
+    }
+    else
+    {
+        if ( p->tag == options.tag )
+        {
+            for ( int i = 0; i < p->len; i++ )
+            {
+                ITMPump( &_r.i, p->d[i] );
+            }
+        }
+    }
+}
+
+// ====================================================================================================
+
+static struct Stream *_tryOpenStream( void )
+{
+    return streamCreateSocket( options.server, options.port );
+}
+// ====================================================================================================
+static void _intHandler( int sig )
+
+{
+    /* CTRL-C exit is not an error... */
+    _r.ending = true;
+}
+// ====================================================================================================
+int main( int argc, char *argv[] )
+{
     uint8_t cbw[TRANSFER_SIZE];
     uint64_t firstTime = 0;
     size_t octetsRxed = 0;
     FILE *opFile;
 
-    ssize_t readLength, t;
-    int flag = 1;
+    ssize_t t;
+    size_t receivedSize;
 
     bool haveSynced = false;
+    bool alreadyReported = false;
+    struct Stream *stream;
 
     if ( !_processOptions( argc, argv ) )
     {
         exit( -1 );
     }
 
-    /* Reset the TPIU handler before we start */
-    TPIUDecoderInit( &_r.t );
-    ITMDecoderInit( &_r.i, options.forceITMSync );
+    genericsScreenHandling( !options.mono );
 
-    sockfd = socket( AF_INET, SOCK_STREAM, 0 );
-    setsockopt( sockfd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof( flag ) );
+    /* Reset the OFLOW handler before we start */
+    OFLOWInit( &_r.c );
+    stream = _tryOpenStream();
 
-    if ( sockfd < 0 )
+    /* This ensures the signal handler gets called */
+    if ( SIG_ERR == signal( SIGINT, _intHandler ) )
     {
-        genericsReport( V_ERROR, "Error creating socket" EOL );
-        return -1;
+        genericsExit( -1, "Failed to establish Int handler" EOL );
     }
 
-
-    /* Now open the network connection */
-    bzero( ( char * ) &serv_addr, sizeof( serv_addr ) );
-    server = gethostbyname( options.server );
-
-    if ( !server )
+    if ( stream == NULL )
     {
-        genericsReport( V_ERROR, "Cannot find host" EOL );
-        return -1;
-    }
 
-    serv_addr.sin_family = AF_INET;
-    bcopy( ( char * )server->h_addr,
-           ( char * )&serv_addr.sin_addr.s_addr,
-           server->h_length );
-    serv_addr.sin_port = htons( options.port );
+        stream = _tryOpenStream();
 
-    if ( connect( sockfd, ( struct sockaddr * ) &serv_addr, sizeof( serv_addr ) ) < 0 )
-    {
-        genericsReport( V_ERROR, "Could not connect" EOL );
-        return -1;
+        if ( stream != NULL )
+        {
+            if ( alreadyReported )
+            {
+                genericsReport( V_INFO, "Connected" EOL );
+                alreadyReported = false;
+            }
+        }
+
+        if ( !alreadyReported )
+        {
+            genericsReport( V_INFO, EOL "No connection" EOL );
+            alreadyReported = true;
+        }
+
+        /* Checking every 100ms for a connection is quite often enough */
+        usleep( 10000 );
     }
 
     /* .... and the file to dump it into */
@@ -330,21 +407,46 @@ int main( int argc, char *argv[] )
     genericsReport( V_INFO, "Waiting for sync" EOL );
 
     /* Start the process of collecting the data */
-    while ( ( readLength = read( sockfd, cbw, TRANSFER_SIZE ) ) > 0 )
+    while ( !_r.ending )
     {
+        enum ReceiveResult result = stream->receive( stream, cbw, TRANSFER_SIZE, NULL, &receivedSize );
+
+        if ( result != RECEIVE_RESULT_OK )
+        {
+            if ( result == RECEIVE_RESULT_EOF )
+            {
+                break;
+            }
+
+            if ( result == RECEIVE_RESULT_ERROR )
+            {
+                genericsReport( V_ERROR, "Reading from connection failed" EOL );
+                return -2;
+            }
+        }
+
         if ( ( options.timelen ) && ( ( firstTime != 0 ) && ( ( _timestamp() - firstTime ) > options.timelen ) ) )
         {
             /* This packet arrived at the end of the window...finish the write process */
             break;
         }
 
-        uint8_t *c = cbw;
 
-        t = readLength;
-
-        while ( t-- )
+        if ( PROT_OFLOW == options.protocol )
         {
-            _protocolPump( *c++ );
+            OFLOWPump( &_r.c, cbw, receivedSize, _OFLOWpacketRxed, &_r );
+        }
+        else
+        {
+
+            uint8_t *c = cbw;
+
+            t = receivedSize;
+
+            while ( t-- )
+            {
+                ITMPump( &_r.i, *c++ );
+            }
         }
 
         /* Check to make sure there's not an unexpected TPIU in here */
@@ -369,7 +471,7 @@ int main( int argc, char *argv[] )
             genericsReport( V_INFO, "Started recording" EOL );
         }
 
-        octetsRxed += fwrite( cbw, 1, readLength, opFile );
+        octetsRxed += fwrite( cbw, 1, receivedSize, opFile );
 
         if ( !ITMDecoderIsSynced( &_r.i ) )
         {
@@ -378,14 +480,19 @@ int main( int argc, char *argv[] )
 
         if ( options.writeSync )
         {
+#if defined(WIN32)
+            _flushall();
+#else
             sync();
+#endif
         }
     }
 
-    close( sockfd );
+    stream->close( stream );
+    free( stream );
     fclose( opFile );
 
-    if ( readLength <= 0 )
+    if ( receivedSize <= 0 )
     {
         genericsReport( V_ERROR, "Network Read failed" EOL );
         return -2;

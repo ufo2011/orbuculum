@@ -65,6 +65,7 @@ struct TPIUDecoder
     struct timeval lastPacket;             /* Timestamp for last packet arrival */
     bool got_lowbits;                      /* Indicator that we've already got the low bits */
     uint8_t rxedPacket[TPIU_PACKET_LEN];   /* Packet currently under construction */
+    bool selfAllocated;                    /* Flag indicating that memory was allocated by the library */
 
     struct TPIUDecoderStats stats;         /* Record of decoder stats */
     struct TPIUCommsStats commsStats;      /* Record of Comms stats */
@@ -82,12 +83,16 @@ struct TPIUPacket
 
 // ====================================================================================================
 void TPIUDecoderForceSync( struct TPIUDecoder *t, uint8_t offset );
-bool TPIUGetPacket( struct TPIUDecoder *t, struct TPIUPacket *p );
 void TPIUDecoderZeroStats( struct TPIUDecoder *t );
 bool TPIUDecoderSynced( struct TPIUDecoder *t );
 struct TPIUDecoderStats *TPIUDecoderGetStats( struct TPIUDecoder *t );
 struct TPIUCommsStats *TPIUGetCommsStats( struct TPIUDecoder *t );
-enum TPIUPumpEvent TPIUPump( struct TPIUDecoder *t, uint8_t d );
+
+void TPIUPump( struct TPIUDecoder *t, uint8_t *frame, int len,
+               void ( *packetRxed )( enum TPIUPumpEvent e, struct TPIUPacket *p, void *param ),
+               void *param );
+
+struct TPIUDecoder *TPIUDecoderCreate( void );
 void TPIUDecoderInit( struct TPIUDecoder *t );
 // ====================================================================================================
 #ifdef __cplusplus
